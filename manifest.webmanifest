@@ -1,0 +1,17 @@
+{
+  "name": "직캠 스테이지",
+  "short_name": "직캠 스테이지",
+  "description": "직캠 영상에서 한 멤버만 따내서 화면에 띄워 두는 앱",
+  "start_url": "./#library",
+  "scope": "./",
+  "display": "fullscreen",
+  "display_override": ["fullscreen", "standalone"],
+  "background_color": "#110f18",
+  "theme_color": "#110f18",
+  "orientation": "any",
+  "icons": [
+    { "src": "icons/icon.svg", "sizes": "any", "type": "image/svg+xml" },
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}

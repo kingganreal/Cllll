@@ -1,0 +1,868 @@
+import { clips, kv, requestPersistence } from './store.js';
+import { AlphaClip } from './player.js';
+
+const $ = sel => document.querySelector(sel);
+const fmtTime = s => {
+  if (!isFinite(s)) return '0:00';
+  s = Math.max(0, s);
+  return `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+};
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+
+let toastTimer;
+function toast(msg, ms = 2600) {
+  const t = $('#toast');
+  t.textContent = msg;
+  t.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.hidden = true; }, ms);
+}
+
+// ---------------------------------------------------------------------------
+// Routing
+
+const views = { library: $('#view-library'), create: $('#view-create'), stage: $('#view-stage') };
+let current = null;
+
+function go(name) {
+  if (!views[name]) name = 'library';
+  if (location.hash !== '#' + name) history.replaceState(null, '', '#' + name);
+  if (current === name) return;
+  if (current === 'stage') stage.leave();
+  if (current === 'create') create.leave();
+  current = name;
+  for (const [k, el] of Object.entries(views)) el.hidden = k !== name;
+  if (name === 'library') library.render();
+  if (name === 'create') create.enter();
+  if (name === 'stage') stage.enter();
+}
+document.addEventListener('click', e => {
+  const nav = e.target.closest('[data-nav]');
+  if (nav) go(nav.dataset.nav);
+});
+window.addEventListener('hashchange', () => go(location.hash.slice(1)));
+
+// ---------------------------------------------------------------------------
+// Wake lock (keep the screen on while processing or showing the stage)
+
+let wakeLock = null, wantWake = false;
+async function keepAwake(on) {
+  wantWake = on;
+  try {
+    if (on && !wakeLock && navigator.wakeLock) {
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeLock.addEventListener('release', () => { wakeLock = null; });
+    } else if (!on && wakeLock) {
+      await wakeLock.release();
+      wakeLock = null;
+    }
+  } catch {}
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && wantWake) keepAwake(true);
+});
+
+// ---------------------------------------------------------------------------
+// Library
+
+const library = {
+  async render() {
+    const grid = $('#clip-grid');
+    let list = [];
+    try { list = await clips.all(); } catch (err) { toast('저장소를 열 수 없어요: ' + err.message); }
+    for (const img of grid.querySelectorAll('img')) URL.revokeObjectURL(img.src);
+    grid.replaceChildren();
+    $('#clip-count').textContent = list.length ? String(list.length) : '';
+    $('#empty-library').hidden = list.length > 0;
+    for (const c of list) grid.append(this.card(c));
+  },
+
+  card(c) {
+    const el = document.createElement('article');
+    el.className = 'card';
+    const thumb = document.createElement('div');
+    thumb.className = 'card-thumb checker';
+    if (c.thumbnail) {
+      const img = document.createElement('img');
+      img.src = URL.createObjectURL(c.thumbnail);
+      img.alt = c.name;
+      thumb.append(img);
+    }
+    thumb.addEventListener('click', () => stage.addAndOpen(c.id));
+    const body = document.createElement('div');
+    body.className = 'card-body';
+    const sizeMb = (c.blob.size / 1048576).toFixed(c.blob.size > 1e7 ? 0 : 1);
+    body.innerHTML = `
+      <div><div class="card-name"></div>
+      <div class="card-meta mono">${fmtTime(c.duration)} · ${c.hasAudio ? '소리 있음' : '소리 없음'} · ${sizeMb}MB</div></div>
+      <div class="card-actions">
+        <button class="btn primary" type="button" data-a="stage">무대로</button>
+        <button class="btn ghost" type="button" data-a="rename">이름</button>
+        <button class="btn ghost" type="button" data-a="save">저장</button>
+        <button class="btn ghost danger" type="button" data-a="delete">삭제</button>
+      </div>`;
+    const nameEl = body.querySelector('.card-name');
+    nameEl.textContent = c.name;
+    body.addEventListener('click', async e => {
+      const b = e.target.closest('[data-a]');
+      if (!b) return;
+      const a = b.dataset.a;
+      if (a === 'stage') stage.addAndOpen(c.id);
+      if (a === 'save') downloadClip(c);
+      if (a === 'rename') {
+        const input = document.createElement('input');
+        input.type = 'text'; input.value = c.name; input.maxLength = 40;
+        nameEl.replaceChildren(input);
+        input.focus(); input.select();
+        const commit = async () => {
+          const v = input.value.trim() || c.name;
+          c.name = v; await clips.put(c);
+          nameEl.textContent = v;
+        };
+        input.addEventListener('keydown', ev => { if (ev.key === 'Enter') input.blur(); });
+        input.addEventListener('blur', commit, { once: true });
+      }
+      if (a === 'delete') {
+        if (b.dataset.confirm) {
+          await clips.delete(c.id);
+          stage.forget(c.id);
+          this.render();
+          toast('삭제했어요');
+        } else {
+          b.dataset.confirm = '1';
+          b.textContent = '한 번 더 누르면 삭제';
+          setTimeout(() => { delete b.dataset.confirm; b.textContent = '삭제'; }, 3000);
+        }
+      }
+    });
+    el.append(thumb, body);
+    return el;
+  },
+};
+
+function downloadClip(c) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(c.blob);
+  // The layout is kept in the name so 가져오기 can read it back.
+  a.download = `${c.name.replace(/[\\/:*?"<>|]/g, '_')}.stage-${c.layout}.mp4`;
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+  toast('기기에 저장했어요. 다른 기기에서 "파일 가져오기"로 열 수 있어요.', 3600);
+}
+
+$('#btn-new').addEventListener('click', () => go('create'));
+$('#btn-open-stage').addEventListener('click', () => go('stage'));
+$('#btn-import').addEventListener('click', () => $('#import-input').click());
+$('#import-input').addEventListener('change', async e => {
+  const files = [...e.target.files];
+  e.target.value = '';
+  for (const f of files) {
+    try {
+      await importClip(f);
+      toast(`"${f.name}" 가져왔어요`);
+    } catch (err) {
+      toast('가져오지 못했어요: ' + err.message, 4000);
+    }
+  }
+  library.render();
+});
+
+// Reads back a clip saved with "저장" (or any colour|alpha packed MP4).
+async function importClip(file) {
+  const v = document.createElement('video');
+  v.muted = true; v.playsInline = true; v.preload = 'auto';
+  v.src = URL.createObjectURL(file);
+  try {
+    await new Promise((res, rej) => { v.onloadeddata = res; v.onerror = () => rej(new Error('영상을 열 수 없어요')); });
+    const m = file.name.match(/\.stage-(sbs|tb)\.mp4$/i);
+    const layout = m ? m[1].toLowerCase() : (v.videoWidth >= v.videoHeight ? 'sbs' : 'tb');
+    const width = layout === 'sbs' ? v.videoWidth / 2 : v.videoWidth;
+    const height = layout === 'sbs' ? v.videoHeight : v.videoHeight / 2;
+    v.currentTime = Math.min(1, v.duration / 3);
+    await new Promise(r => { v.onseeked = r; });
+    const thumbnail = await packedThumbnail(v, layout, width, height);
+    const name = file.name.replace(/(\.stage-(sbs|tb))?\.mp4$/i, '');
+    await clips.put({
+      id: uid(), name, created: Date.now(), blob: file, thumbnail, layout,
+      crop: { x: 0, y: 0, w: 1, h: 1 }, width, height, duration: v.duration, hasAudio: true,
+    });
+  } finally {
+    URL.revokeObjectURL(v.src);
+  }
+}
+
+function packedThumbnail(v, layout, width, height) {
+  const s = Math.min(1, 360 / Math.max(width, height));
+  const w = Math.round(width * s), h = Math.round(height * s);
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  const ax = layout === 'sbs' ? width : 0, ay = layout === 'sbs' ? 0 : height;
+  ctx.drawImage(v, ax, ay, width, height, 0, 0, w, h);
+  const a = ctx.getImageData(0, 0, w, h);
+  ctx.clearRect(0, 0, w, h);
+  ctx.drawImage(v, 0, 0, width, height, 0, 0, w, h);
+  const img = ctx.getImageData(0, 0, w, h);
+  for (let j = 0; j < img.data.length; j += 4) img.data[j + 3] = a.data[j];
+  ctx.putImageData(img, 0, 0);
+  return new Promise(r => c.toBlob(r, 'image/png'));
+}
+
+// ---------------------------------------------------------------------------
+// Create (extract a member from a fancam)
+
+const create = {
+  file: null, url: null, start: 0, end: 0, persons: null, target: null, abort: null, busy: false,
+
+  enter() {
+    const warn = [];
+    if (typeof VideoEncoder === 'undefined') warn.push('이 브라우저는 영상 인코딩을 지원하지 않아요. 최신 Chrome, Edge, Safari(iOS 16.4 이상)에서 열어 주세요.');
+    $('#create-error').hidden = !warn.length;
+    $('#create-error').textContent = warn.join(' ');
+    // Load the model in the background so it's ready by the time she's picked.
+    import('./processor.js').then(p => p.getLandmarker()).catch(err => console.warn(err));
+  },
+
+  leave() {
+    if (this.busy) this.abort?.abort();
+    keepAwake(false);
+  },
+
+  reset() {
+    this.persons = this.target = null;
+    $('#pick-canvas').hidden = true;
+    $('#src-video').hidden = false;
+    $('#pick-hint').hidden = true;
+    $('#btn-start').hidden = true;
+    $('#btn-pick').hidden = false;
+    $('#btn-pick').textContent = '멤버 고르기';
+  },
+
+  async load(file) {
+    this.file = file;
+    if (this.url) URL.revokeObjectURL(this.url);
+    this.url = URL.createObjectURL(file);
+    const v = $('#src-video');
+    v.src = this.url;
+    v.controls = true;
+    await new Promise((res, rej) => {
+      v.onloadedmetadata = res;
+      v.onerror = () => rej(new Error('이 영상 형식은 브라우저에서 열 수 없어요. MP4로 바꿔서 다시 시도해 주세요.'));
+    });
+    this.start = 0;
+    this.end = v.duration;
+    $('#scrub').max = String(v.duration);
+    $('#step-edit').hidden = false;
+    $('#drop').classList.add('compact');
+    $('#drop strong').textContent = '다른 영상 고르기';
+    $('#create-error').hidden = true;
+    const base = file.name.replace(/\.[^.]+$/, '');
+    if (!$('#clip-name').dataset.touched) $('#clip-name').value = /설윤|sullyoon|seolyoon/i.test(base) ? '설윤' : $('#clip-name').value;
+    this.reset();
+    this.updateTrim();
+  },
+
+  updateTrim() {
+    const v = $('#src-video');
+    $('#start-out').textContent = fmtTime(this.start);
+    $('#end-out').textContent = fmtTime(this.end);
+    $('#len-out').textContent = fmtTime(this.end - this.start);
+    $('#now-out').textContent = fmtTime(v.currentTime);
+  },
+
+  async pick() {
+    const btn = $('#btn-pick');
+    btn.disabled = true;
+    btn.textContent = 'AI 모델 불러오는 중…';
+    try {
+      const p = await import('./processor.js');
+      await p.getLandmarker();
+      const v = $('#src-video');
+      v.pause();
+      btn.textContent = '사람 찾는 중…';
+      await p.seek(v, this.start + 0.02);
+      const [aw, ah] = p.analysisSize(v);
+      const c = document.createElement('canvas'); c.width = aw; c.height = ah;
+      c.getContext('2d').drawImage(v, 0, 0, aw, ah);
+      this.persons = await p.detect(c);
+      if (!this.persons.length) {
+        throw new Error('시작 장면에서 사람을 찾지 못했어요. 시작 지점을 멤버가 잘 보이는 곳으로 옮겨 주세요.');
+      }
+      this.target = p.pickDefault(this.persons);
+      this.pickApi = p;
+      this.drawPick();
+      $('#pick-canvas').hidden = false;
+      v.hidden = true;
+      $('#pick-hint').hidden = false;
+      $('#btn-start').hidden = false;
+      btn.textContent = '다시 고르기';
+    } catch (err) {
+      $('#create-error').textContent = err.message;
+      $('#create-error').hidden = false;
+      btn.textContent = '멤버 고르기';
+    } finally {
+      btn.disabled = false;
+    }
+  },
+
+  drawPick() {
+    const v = $('#src-video');
+    const c = $('#pick-canvas');
+    const s = Math.min(1, 1280 / Math.max(v.videoWidth, v.videoHeight));
+    c.width = Math.round(v.videoWidth * s); c.height = Math.round(v.videoHeight * s);
+    const ctx = c.getContext('2d');
+    ctx.drawImage(v, 0, 0, c.width, c.height);
+    // Dim everyone, then tint each person: pink for the chosen one, blue for the rest.
+    ctx.fillStyle = 'rgba(8,6,12,.45)';
+    ctx.fillRect(0, 0, c.width, c.height);
+    for (const p of this.persons) {
+      const chosen = p === this.target;
+      const m = document.createElement('canvas'); m.width = p.w; m.height = p.h;
+      const mctx = m.getContext('2d');
+      const img = mctx.createImageData(p.w, p.h);
+      const [r, g, b] = chosen ? [255, 159, 182] : [159, 211, 255];
+      for (let k = 0, j = 0; k < p.mask.length; k++, j += 4) {
+        img.data[j] = r; img.data[j + 1] = g; img.data[j + 2] = b;
+        img.data[j + 3] = p.mask[k] > 0.5 ? (chosen ? 110 : 70) : 0;
+      }
+      mctx.putImageData(img, 0, 0);
+      ctx.drawImage(m, 0, 0, c.width, c.height);
+      if (chosen) {
+        // Re-draw her un-dimmed so she pops.
+        mctx.globalCompositeOperation = 'source-in';
+        mctx.drawImage(v, 0, 0, p.w, p.h);
+        ctx.globalAlpha = 0.75;
+        ctx.drawImage(m, 0, 0, c.width, c.height);
+        ctx.globalAlpha = 1;
+      }
+      if (p.bbox) {
+        const [x0, y0] = p.bbox;
+        ctx.font = `600 ${Math.round(c.height / 32)}px ${getComputedStyle(document.body).fontFamily}`;
+        ctx.fillStyle = chosen ? '#ff9fb6' : '#9fd3ff';
+        ctx.fillText(chosen ? '✓ 선택됨' : '탭해서 선택', x0 * c.width + 6, Math.max(c.height / 28, y0 * c.height - 8));
+      }
+    }
+  },
+
+  async run() {
+    const v = $('#src-video');
+    const p = this.pickApi;
+    const opts = {
+      file: this.file, video: v, start: this.start, end: this.end, target: this.target,
+      fps: Number($('#fps').value), maxSide: Number($('#quality').value),
+      withAudio: $('#with-audio').checked,
+    };
+    opts.bitrate = Math.round(opts.maxSide * opts.maxSide * 2.2 * opts.fps / 30); // ~4–7 Mbps
+    const name = $('#clip-name').value.trim() || '설윤';
+
+    this.busy = true;
+    this.abort = new AbortController();
+    opts.signal = this.abort.signal;
+    $('#step-edit').hidden = true;
+    $('#drop').hidden = true;
+    $('#step-progress').hidden = false;
+    keepAwake(true);
+    const pc = $('#progress-canvas'), pctx = pc.getContext('2d');
+    let lastDraw = 0;
+    opts.onProgress = info => {
+      const pct = info.done / info.total * 100;
+      $('#progress-bar').style.width = pct.toFixed(1) + '%';
+      $('#progress-text').textContent =
+        `${info.done} / ${info.total} 프레임 · ${pct.toFixed(0)}% · 남은 시간 약 ${fmtTime(info.eta)}${info.found ? '' : ' · 멤버를 놓쳤어요, 다시 찾는 중'}`;
+      const now = performance.now();
+      if (now - lastDraw > 250) {
+        lastDraw = now;
+        if (pc.width !== info.preview.width) { pc.width = info.preview.width; pc.height = info.preview.height; }
+        pctx.drawImage(info.preview, 0, 0);
+      }
+    };
+    try {
+      const result = await p.extract(opts);
+      const clip = { id: uid(), name, created: Date.now(), ...result };
+      await clips.put(clip);
+      requestPersistence();
+      toast('완성! 무대에 올렸어요');
+      this.done();
+      await stage.addAndOpen(clip.id);
+    } catch (err) {
+      this.done();
+      if (err.name !== 'AbortError') {
+        console.error(err);
+        $('#create-error').textContent = '추출에 실패했어요: ' + err.message;
+        $('#create-error').hidden = false;
+      }
+    }
+  },
+
+  done() {
+    this.busy = false;
+    keepAwake(false);
+    $('#step-progress').hidden = true;
+    $('#step-edit').hidden = false;
+    $('#drop').hidden = false;
+    $('#progress-bar').style.width = '0';
+    this.reset();
+  },
+};
+
+$('#file-input').addEventListener('change', async e => {
+  const f = e.target.files[0];
+  e.target.value = '';
+  if (!f) return;
+  try { await create.load(f); }
+  catch (err) { $('#create-error').textContent = err.message; $('#create-error').hidden = false; }
+});
+$('#clip-name').addEventListener('input', e => { e.target.dataset.touched = '1'; });
+$('#src-video').addEventListener('timeupdate', () => {
+  $('#scrub').value = String($('#src-video').currentTime);
+  create.updateTrim();
+});
+$('#scrub').addEventListener('input', e => {
+  const v = $('#src-video');
+  v.currentTime = Number(e.target.value);
+  create.reset();
+});
+$('#set-start').addEventListener('click', () => {
+  const t = $('#src-video').currentTime;
+  create.start = Math.min(t, create.end - 0.5);
+  create.reset();
+  create.updateTrim();
+});
+$('#set-end').addEventListener('click', () => {
+  const t = $('#src-video').currentTime;
+  create.end = Math.max(t, create.start + 0.5);
+  create.updateTrim();
+});
+$('#btn-pick').addEventListener('click', () => {
+  if (!create.file) return;
+  if (create.persons) { create.reset(); $('#src-video').hidden = false; return; }
+  create.pick();
+});
+$('#pick-canvas').addEventListener('click', e => {
+  const c = e.currentTarget, r = c.getBoundingClientRect();
+  const nx = (e.clientX - r.left) / r.width, ny = (e.clientY - r.top) / r.height;
+  create.target = create.pickApi.pickAt(create.persons, nx, ny);
+  create.drawPick();
+});
+$('#btn-start').addEventListener('click', () => create.run());
+$('#btn-cancel').addEventListener('click', () => create.abort?.abort());
+
+// ---------------------------------------------------------------------------
+// Stage: the "wallpaper" where clips dance
+
+const BACKGROUNDS = [
+  { id: 'night', name: '밤 무대', css: 'radial-gradient(80% 60% at 50% 100%, #3a2a4a 0%, #16121f 60%, #0b0910 100%)' },
+  { id: 'spot', name: '스포트라이트', css: 'radial-gradient(40% 70% at 50% 35%, rgba(255,236,214,.35), transparent 70%), linear-gradient(#07060a, #1c1726)' },
+  { id: 'dawn', name: '새벽', css: 'linear-gradient(160deg, #ffd6e0 0%, #c9d8ff 55%, #a6c8ff 100%)' },
+  { id: 'mint', name: '민트', css: 'linear-gradient(180deg, #d9fff3, #a8e8dc)' },
+  { id: 'black', name: '검정', css: '#000' },
+  { id: 'white', name: '흰색', css: '#fff' },
+  { id: 'green', name: '그린스크린', css: '#00ff00' },
+  { id: 'blue', name: '블루스크린', css: '#0047ff' },
+];
+
+const stage = {
+  state: { bg: 'night', color: '#222222', sprites: [] },
+  sprites: [],          // { s: state entry, el, clip: AlphaClip, data }
+  selected: null,
+  loaded: false,
+  playing: true,
+  bgUrl: null,
+
+  async load() {
+    if (this.loaded) return;
+    this.loaded = true;
+    try {
+      const saved = await kv.get('stage');
+      if (saved) this.state = { ...this.state, ...saved };
+    } catch {}
+  },
+
+  save() {
+    clearTimeout(this.saveTimer);
+    this.saveTimer = setTimeout(() => kv.set('stage', this.state).catch(() => {}), 300);
+  },
+
+  async enter() {
+    await this.load();
+    await this.applyBackground();
+    await this.mount();
+    this.playing = true;
+    this.updatePlayButton();
+    keepAwake(true);
+    this.poke();
+    if (!this.resizeObserver) {
+      this.resizeObserver = new ResizeObserver(() => this.layoutAll());
+      this.resizeObserver.observe($('#stage'));
+    }
+  },
+
+  leave() {
+    keepAwake(false);
+    this.closeSheet();
+    this.select(null);
+    for (const sp of this.sprites) { sp.clip.destroy(); sp.el.remove(); }
+    this.sprites = [];
+    if (document.fullscreenElement) document.exitFullscreen?.().catch(() => {});
+  },
+
+  async mount() {
+    for (const sp of this.sprites) { sp.clip.destroy(); sp.el.remove(); }
+    this.sprites = [];
+    const keep = [];
+    for (const s of this.state.sprites) {
+      const data = await clips.get(s.clipId).catch(() => null);
+      if (!data) continue;
+      keep.push(s);
+      this.spawn(s, data);
+    }
+    this.state.sprites = keep;
+    $('#stage-empty').hidden = keep.length > 0;
+  },
+
+  spawn(s, data) {
+    const clip = new AlphaClip(data);
+    const el = document.createElement('div');
+    el.className = 'sprite';
+    el.append(clip.canvas);
+    $('#stage').append(el);
+    clip.setFlip(!!s.flip);
+    clip.video.playbackRate = s.speed || 1;
+    clip.video.muted = true; // autoplay needs muted; the user turns sound on with a tap
+    const sp = { s, el, clip, data };
+    this.sprites.push(sp);
+    this.layout(sp);
+    this.bindGestures(sp);
+    if (this.playing) clip.play();
+    return sp;
+  },
+
+  async addAndOpen(clipId) {
+    await this.load();
+    const n = this.state.sprites.length;
+    this.state.sprites.push({ clipId, x: 0.5 + ((n % 3) - 1) * 0.22 * Math.min(1, n), y: 0.55, h: 0.85, flip: false, speed: 1 });
+    this.save();
+    if (current === 'stage') {
+      const data = await clips.get(clipId);
+      const sp = this.spawn(this.state.sprites.at(-1), data);
+      $('#stage-empty').hidden = true;
+      this.select(sp);
+    } else {
+      go('stage');
+    }
+  },
+
+  forget(clipId) {
+    this.state.sprites = this.state.sprites.filter(s => s.clipId !== clipId);
+    this.save();
+  },
+
+  layout(sp) {
+    const st = $('#stage').getBoundingClientRect();
+    const h = sp.s.h * st.height;
+    const w = h * sp.clip.aspect;
+    Object.assign(sp.el.style, {
+      width: w + 'px', height: h + 'px',
+      left: (sp.s.x * st.width - w / 2) + 'px', top: (sp.s.y * st.height - h / 2) + 'px',
+    });
+    sp.clip.resize(w, h);
+  },
+  layoutAll() { for (const sp of this.sprites) this.layout(sp); },
+
+  bindGestures(sp) {
+    const pts = new Map();
+    let startDist = 0, startH = 0, last = null;
+    const stageRect = () => $('#stage').getBoundingClientRect();
+    const mid = () => {
+      const a = [...pts.values()];
+      return { x: a.reduce((s, p) => s + p.x, 0) / a.length, y: a.reduce((s, p) => s + p.y, 0) / a.length };
+    };
+    const dist = () => { const [a, b] = [...pts.values()]; return Math.hypot(a.x - b.x, a.y - b.y); };
+
+    sp.el.addEventListener('pointerdown', e => {
+      e.preventDefault();
+      e.stopPropagation();
+      sp.el.setPointerCapture(e.pointerId);
+      pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      this.select(sp);
+      this.poke();
+      last = mid();
+      if (pts.size === 2) { startDist = dist(); startH = sp.s.h; }
+    });
+    sp.el.addEventListener('pointermove', e => {
+      if (!pts.has(e.pointerId)) return;
+      pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      const r = stageRect();
+      const m = mid();
+      sp.s.x += (m.x - last.x) / r.width;
+      sp.s.y += (m.y - last.y) / r.height;
+      last = m;
+      if (pts.size === 2 && startDist > 0) sp.s.h = Math.min(3, Math.max(0.1, startH * dist() / startDist));
+      this.layout(sp);
+    });
+    const end = e => {
+      if (!pts.delete(e.pointerId)) return;
+      last = pts.size ? mid() : null;
+      if (pts.size === 2) { startDist = dist(); startH = sp.s.h; } else startDist = 0;
+      this.save();
+    };
+    sp.el.addEventListener('pointerup', end);
+    sp.el.addEventListener('pointercancel', end);
+    sp.el.addEventListener('wheel', e => {
+      e.preventDefault();
+      sp.s.h = Math.min(3, Math.max(0.1, sp.s.h * Math.exp(-e.deltaY * 0.0015)));
+      this.layout(sp);
+      this.save();
+    }, { passive: false });
+  },
+
+  select(sp) {
+    for (const o of this.sprites) o.el.classList.toggle('selected', o === sp);
+    this.selected = sp;
+    $('#sprite-bar').hidden = !sp;
+    if (sp) {
+      $('#sprite-speed').value = String(sp.s.speed || 1);
+      const snd = $('#sprite-sound');
+      snd.hidden = !sp.data.hasAudio;
+      snd.textContent = sp.clip.video.muted ? '소리 켜기' : '소리 끄기';
+    }
+  },
+
+  // Show the controls for a moment; in fullscreen they fade away on their own.
+  poke() {
+    const view = views.stage;
+    view.classList.remove('ui-hidden');
+    $('#stage').classList.remove('immersive');
+    clearTimeout(this.hideTimer);
+    this.hideTimer = setTimeout(() => {
+      if (!$('#sheet').hidden) return;
+      view.classList.add('ui-hidden');
+      $('#stage').classList.add('immersive');
+    }, 3500);
+  },
+
+  async applyBackground() {
+    const st = $('#stage');
+    if (this.bgUrl) { URL.revokeObjectURL(this.bgUrl); this.bgUrl = null; }
+    const { bg } = this.state;
+    if (bg === 'image') {
+      const blob = await kv.get('bgImage').catch(() => null);
+      if (blob) {
+        this.bgUrl = URL.createObjectURL(blob);
+        st.style.background = `center / cover no-repeat url("${this.bgUrl}"), #000`;
+        return;
+      }
+    }
+    if (bg === 'color') { st.style.background = this.state.color; return; }
+    st.style.background = (BACKGROUNDS.find(b => b.id === bg) || BACKGROUNDS[0]).css;
+  },
+
+  openSheet(title, content) {
+    $('#sheet-title').textContent = title;
+    $('#sheet-body').replaceChildren(content);
+    $('#sheet').hidden = false;
+    this.poke();
+  },
+  closeSheet() { $('#sheet').hidden = true; },
+
+  async showAddSheet() {
+    const list = await clips.all();
+    const wrap = document.createElement('div');
+    if (!list.length) {
+      wrap.innerHTML = '<p class="hint">아직 클립이 없어요. 보관함에서 직캠 영상으로 먼저 만들어 주세요.</p>';
+      const b = document.createElement('button');
+      b.className = 'btn primary'; b.type = 'button'; b.textContent = '클립 만들러 가기';
+      b.onclick = () => go('create');
+      wrap.append(b);
+    } else {
+      wrap.className = 'pick-list';
+      for (const c of list) {
+        const b = document.createElement('button');
+        b.type = 'button'; b.className = 'pick-item';
+        const img = document.createElement('img');
+        img.className = 'checker';
+        if (c.thumbnail) img.src = URL.createObjectURL(c.thumbnail);
+        const span = document.createElement('span');
+        span.textContent = c.name;
+        b.append(img, span);
+        b.onclick = () => { this.closeSheet(); this.addAndOpen(c.id); };
+        wrap.append(b);
+      }
+    }
+    this.openSheet('클립 올리기', wrap);
+  },
+
+  showBgSheet() {
+    const wrap = document.createElement('div');
+    wrap.style.display = 'grid'; wrap.style.gap = '14px';
+    const sw = document.createElement('div');
+    sw.className = 'swatches';
+    for (const b of BACKGROUNDS) {
+      const el = document.createElement('button');
+      el.type = 'button';
+      el.className = 'swatch' + (this.state.bg === b.id ? ' on' : '');
+      el.style.background = b.css;
+      el.textContent = b.name;
+      el.onclick = () => { this.state.bg = b.id; this.save(); this.applyBackground(); this.showBgSheet(); };
+      sw.append(el);
+    }
+    const img = document.createElement('button');
+    img.type = 'button';
+    img.className = 'swatch' + (this.state.bg === 'image' ? ' on' : '');
+    img.style.background = 'repeating-linear-gradient(45deg, #2e2a3b 0 8px, #1b1825 8px 16px)';
+    img.textContent = '내 사진…';
+    img.onclick = () => $('#bg-input').click();
+    sw.append(img);
+
+    const row = document.createElement('label');
+    row.className = 'swatch-color';
+    row.innerHTML = '<input type="color" id="bg-color"> 단색 직접 고르기';
+    const input = row.querySelector('input');
+    input.value = this.state.color;
+    input.oninput = () => { this.state.bg = 'color'; this.state.color = input.value; this.save(); this.applyBackground(); };
+
+    const tip = document.createElement('p');
+    tip.className = 'hint';
+    tip.textContent = '그린스크린/블루스크린은 화면 녹화 후 다른 편집 앱에서 크로마키로 배경을 지울 때 써요.';
+    wrap.append(sw, row, tip);
+    this.openSheet('배경', wrap);
+  },
+
+  updatePlayButton() { $('#btn-play').textContent = this.playing ? '일시정지' : '재생'; },
+
+  togglePlay() {
+    this.playing = !this.playing;
+    for (const sp of this.sprites) this.playing ? sp.clip.play() : sp.clip.video.pause();
+    this.updatePlayButton();
+  },
+
+  async fullscreen() {
+    const el = document.documentElement;
+    try {
+      if (document.fullscreenElement || document.webkitFullscreenElement) {
+        await (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+      } else if (el.requestFullscreen || el.webkitRequestFullscreen) {
+        await (el.requestFullscreen || el.webkitRequestFullscreen).call(el, { navigationUI: 'hide' });
+      } else {
+        toast('iPhone은 공유 → "홈 화면에 추가"로 설치하면 전체화면으로 열려요.', 4200);
+      }
+    } catch {
+      toast('전체화면을 열 수 없어요.');
+    }
+  },
+
+  // Desktop Chrome/Edge: pop the stage into an always-on-top mini window.
+  async pip() {
+    if (this.pipWindow) { this.pipWindow.close(); return; }
+    try {
+      const st = $('#stage');
+      const r = st.getBoundingClientRect();
+      const pw = await documentPictureInPicture.requestWindow({
+        width: Math.round(Math.min(480, r.width / 2)), height: Math.round(Math.min(720, r.height / 1.5)),
+      });
+      this.pipWindow = pw;
+      for (const link of document.querySelectorAll('link[rel=stylesheet], style')) pw.document.head.append(link.cloneNode(true));
+      pw.document.body.style.cssText = 'margin:0;height:100vh;overflow:hidden;background:#000';
+      const placeholder = document.createElement('div');
+      placeholder.className = 'stage-empty';
+      placeholder.innerHTML = '<p>작은 창에서 재생 중이에요.</p>';
+      st.before(placeholder);
+      pw.document.body.append(st);
+      const ro = new pw.ResizeObserver(() => this.layoutAll());
+      ro.observe(st);
+      pw.addEventListener('pagehide', () => {
+        ro.disconnect();
+        placeholder.replaceWith(st);
+        this.pipWindow = null;
+        this.layoutAll();
+      });
+      this.layoutAll();
+    } catch (err) {
+      toast('작은 창을 열 수 없어요: ' + err.message);
+    }
+  },
+};
+
+$('#stage').addEventListener('pointerdown', e => {
+  if (e.target.closest('.sprite')) return;
+  stage.select(null);
+  if (views.stage.classList.contains('ui-hidden')) stage.poke();
+  else if (!$('#sheet').hidden) stage.closeSheet();
+});
+views.stage.addEventListener('pointermove', e => { if (e.pointerType === 'mouse') stage.poke(); });
+views.stage.addEventListener('click', e => {
+  const a = e.target.closest('[data-action]');
+  if (!a) return;
+  stage.poke();
+  ({
+    add: () => stage.showAddSheet(),
+    bg: () => stage.showBgSheet(),
+    play: () => stage.togglePlay(),
+    fullscreen: () => stage.fullscreen(),
+    pip: () => stage.pip(),
+    'close-sheet': () => stage.closeSheet(),
+  })[a.dataset.action]?.();
+});
+$('#sprite-bar').addEventListener('click', e => {
+  const b = e.target.closest('[data-sprite]');
+  const sp = stage.selected;
+  if (!b || !sp) return;
+  stage.poke();
+  const act = b.dataset.sprite;
+  if (act === 'flip') { sp.s.flip = !sp.s.flip; sp.clip.setFlip(sp.s.flip); }
+  if (act === 'sound') {
+    sp.clip.video.muted = !sp.clip.video.muted;
+    if (!sp.clip.video.muted) sp.clip.play();
+    b.textContent = sp.clip.video.muted ? '소리 켜기' : '소리 끄기';
+  }
+  if (act === 'front') {
+    $('#stage').append(sp.el);
+    stage.state.sprites = [...stage.state.sprites.filter(s => s !== sp.s), sp.s];
+  }
+  if (act === 'remove') {
+    sp.clip.destroy(); sp.el.remove();
+    stage.sprites = stage.sprites.filter(o => o !== sp);
+    stage.state.sprites = stage.state.sprites.filter(s => s !== sp.s);
+    stage.select(null);
+    $('#stage-empty').hidden = stage.sprites.length > 0;
+  }
+  stage.save();
+});
+$('#sprite-speed').addEventListener('change', e => {
+  const sp = stage.selected;
+  if (!sp) return;
+  sp.s.speed = Number(e.target.value);
+  sp.clip.video.playbackRate = sp.s.speed;
+  stage.save();
+});
+$('#bg-input').addEventListener('change', async e => {
+  const f = e.target.files[0];
+  e.target.value = '';
+  if (!f) return;
+  await kv.set('bgImage', f);
+  stage.state.bg = 'image';
+  stage.save();
+  await stage.applyBackground();
+  stage.showBgSheet();
+});
+document.addEventListener('keydown', e => {
+  if (current !== 'stage' || e.target.matches('input, select, textarea')) return;
+  if (e.key === ' ') { e.preventDefault(); stage.togglePlay(); }
+  if (e.key === 'f') stage.fullscreen();
+  if ((e.key === 'Delete' || e.key === 'Backspace') && stage.selected) $('[data-sprite=remove]').click();
+});
+
+// ---------------------------------------------------------------------------
+// Boot
+
+if ('documentPictureInPicture' in window && matchMedia('(pointer: fine)').matches) $('#btn-pip').hidden = false;
+if (typeof VideoEncoder === 'undefined') {
+  const w = $('#support-warning');
+  w.hidden = false;
+  w.textContent = '이 브라우저에선 새 클립을 만들 수 없어요(보기만 가능). 최신 Chrome, Edge, Safari(iOS 16.4 이상)를 써 주세요.';
+}
+if ('serviceWorker' in navigator && location.protocol !== 'file:') {
+  navigator.serviceWorker.register('sw.js').catch(() => {});
+}
+go(location.hash.slice(1) || 'library');
