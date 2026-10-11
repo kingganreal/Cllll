@@ -225,8 +225,49 @@ function fitSize(w, h, maxSide) {
   return [Math.max(2, Math.round(w * s / 2) * 2), Math.max(2, Math.round(h * s / 2) * 2)];
 }
 
-export function analysisSize(video) {
-  return fitSize(video.videoWidth, video.videoHeight, ANALYSIS_SIDE);
+// The part of the frame to use. Screen recordings carry black bars we crop away.
+export function fullRect(video) {
+  return { x: 0, y: 0, w: video.videoWidth, h: video.videoHeight };
+}
+
+export function analysisSize(rect) {
+  return fitSize(rect.w, rect.h, ANALYSIS_SIDE);
+}
+
+// Finds black bars (letterboxing, screen-recording borders) by sampling a few frames.
+// Returns the picture area in video pixels, or null when there's nothing worth cropping.
+export async function detectContentRect(video, start, end) {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const s = Math.min(1, 240 / Math.max(vw, vh));
+  const w = Math.max(8, Math.round(vw * s)), h = Math.max(8, Math.round(vh * s));
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  const rowLit = new Uint8Array(h), colLit = new Uint8Array(w);
+  const samples = 6;
+  for (let i = 0; i < samples; i++) {
+    await seek(video, start + (end - start) * (i + 0.5) / samples);
+    ctx.drawImage(video, 0, 0, w, h);
+    const d = ctx.getImageData(0, 0, w, h).data;
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const j = (y * w + x) * 4;
+        if (Math.max(d[j], d[j + 1], d[j + 2]) > 40) { rowLit[y] = 1; colLit[x] = 1; }
+      }
+    }
+  }
+  const first = a => a.indexOf(1), last = a => a.lastIndexOf(1);
+  const y0 = first(rowLit), y1 = last(rowLit), x0 = first(colLit), x1 = last(colLit);
+  if (y0 < 0 || x0 < 0) return null;
+  const cw = x1 - x0 + 1, ch = y1 - y0 + 1;
+  // Ignore slivers (<3%) and anything that would throw away most of the frame.
+  if (cw * ch < w * h * 0.15 || (cw > w * 0.97 && ch > h * 0.97)) return null;
+  const inset = 1; // stay clear of the soft edge between bar and picture
+  const rx = Math.round((x0 + inset) / s), ry = Math.round((y0 + inset) / s);
+  return {
+    x: rx, y: ry,
+    w: Math.min(vw - rx, Math.round((cw - 2 * inset) / s)),
+    h: Math.min(vh - ry, Math.round((ch - 2 * inset) / s)),
+  };
 }
 
 async function pickVideoEncoder(width, height, fps, bitrate) {
@@ -312,6 +353,7 @@ async function encodeAudio(audio, muxer) {
  * @param {File} o.file          source video file
  * @param {HTMLVideoElement} o.video  a loaded <video> for `file`
  * @param {number} o.start, o.end     trim range in seconds
+ * @param {{x,y,w,h}} [o.rect] part of the frame to use (video pixels); whole frame if omitted
  * @param {object} o.target       person picked on the first frame (from detectPersons)
  * @param {number} o.fps, o.maxSide, o.bitrate
  * @param {boolean} o.withAudio
@@ -320,8 +362,9 @@ async function encodeAudio(audio, muxer) {
  */
 export async function extract(o) {
   const { video, start, end, fps, signal } = o;
-  const [aw, ah] = analysisSize(video);
-  const [hw, hh] = fitSize(video.videoWidth, video.videoHeight, o.maxSide);
+  const r = o.rect ?? fullRect(video);
+  const [aw, ah] = analysisSize(r);
+  const [hw, hh] = fitSize(r.w, r.h, o.maxSide);
   // Portrait fancams pack side-by-side, landscape ones top/bottom, keeping frames squarish.
   const layout = hh >= hw ? 'sbs' : 'tb';
   const W = layout === 'sbs' ? hw * 2 : hw;
@@ -376,7 +419,7 @@ export async function extract(o) {
 
     // Aim for the middle of each output frame's time slot.
     await seek(video, Math.min(start + (i + 0.5) / fps, video.duration - 0.001));
-    aCtx.drawImage(video, 0, 0, aw, ah);
+    aCtx.drawImage(video, r.x, r.y, r.w, r.h, 0, 0, aw, ah);
     const persons = await detect(aCanvas);
     const person = prev ? track(persons, prev) : pickDefault(persons);
 
@@ -421,7 +464,7 @@ export async function extract(o) {
       md[j] = md[j + 1] = md[j + 2] = v; md[j + 3] = 255;
     }
     mCtx.putImageData(maskImage, 0, 0);
-    oCtx.drawImage(video, 0, 0, hw, hh);
+    oCtx.drawImage(video, r.x, r.y, r.w, r.h, 0, 0, hw, hh);
     oCtx.drawImage(mCanvas, alphaX, alphaY, hw, hh);
 
     const frame = new VideoFrame(out, { timestamp: Math.round(i * 1e6 / fps), duration: Math.round(1e6 / fps) });
@@ -430,7 +473,7 @@ export async function extract(o) {
     while (encoder.encodeQueueSize > 3) await new Promise(r => setTimeout(r, 5));
 
     if (!thumbnail && i >= Math.min(total - 1, Math.floor(total * 0.15))) {
-      thumbnail = await makeThumbnail(video, mCanvas, hw, hh);
+      thumbnail = await makeThumbnail(video, r, mCanvas, hw, hh);
     }
 
     [alpha, prevAlpha] = [prevAlpha ?? new Float32Array(n), alpha];
@@ -463,14 +506,14 @@ export async function extract(o) {
   };
 }
 
-async function makeThumbnail(video, maskCanvas, hw, hh) {
+async function makeThumbnail(video, r, maskCanvas, hw, hh) {
   const s = Math.min(1, 360 / Math.max(hw, hh));
   const w = Math.round(hw * s), h = Math.round(hh * s);
   const c = document.createElement('canvas'); c.width = w; c.height = h;
   const ctx = c.getContext('2d', { willReadFrequently: true });
   ctx.drawImage(maskCanvas, 0, 0, w, h);
   const a = ctx.getImageData(0, 0, w, h);
-  ctx.drawImage(video, 0, 0, w, h);
+  ctx.drawImage(video, r.x, r.y, r.w, r.h, 0, 0, w, h);
   const img = ctx.getImageData(0, 0, w, h);
   for (let j = 0; j < img.data.length; j += 4) img.data[j + 3] = a.data[j];
   ctx.putImageData(img, 0, 0);

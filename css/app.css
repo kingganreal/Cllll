@@ -119,6 +119,19 @@ button, input, select { font: inherit; color: inherit; }
 .hint { margin: 0; font-size: 13px; color: var(--muted); }
 
 /* ---------- create ---------- */
+.yt { display: grid; gap: 8px; padding: 14px 16px; border-radius: var(--radius); background: var(--panel); border: 1px solid var(--line); }
+.yt h2 { margin: 0; font-weight: 400; }
+.yt-row { display: flex; gap: 8px; }
+.yt-row input { flex: 1; min-width: 0; padding: 9px 12px; border-radius: 10px; border: 1px solid var(--line); background: var(--ink); }
+.yt-help { display: grid; gap: 12px; padding-top: 4px; }
+.yt-help ol { margin: 0; padding-left: 1.3em; display: grid; gap: 6px; color: var(--muted); max-width: 70ch; }
+.yt-help ol b { color: var(--text); font-weight: 600; }
+.yt-help a { color: var(--cool); }
+.yt-help .row { align-items: center; }
+.rec-dot { display: inline-block; width: .6em; height: .6em; border-radius: 50%; background: var(--danger); margin-right: .4em; animation: blink 1s steps(2) infinite; }
+@keyframes blink { 50% { opacity: .2; } }
+.drop.compact + .yt { display: none; }
+
 .drop {
   display: grid; gap: 4px; place-items: center; text-align: center; cursor: pointer;
   padding: 36px 16px; border-radius: var(--radius); border: 1px dashed var(--line); background: var(--panel);

@@ -214,6 +214,15 @@ function packedThumbnail(v, layout, width, height) {
 
 const create = {
   file: null, url: null, start: 0, end: 0, persons: null, target: null, abort: null, busy: false,
+  detectedRect: null,
+
+  // The area of the frame we work on: the picture without black bars, unless switched off.
+  rect() {
+    const v = $('#src-video');
+    return this.detectedRect && $('#auto-crop').checked
+      ? this.detectedRect
+      : { x: 0, y: 0, w: v.videoWidth, h: v.videoHeight };
+  },
 
   enter() {
     const warn = [];
@@ -250,6 +259,19 @@ const create = {
       v.onloadedmetadata = res;
       v.onerror = () => rej(new Error('이 영상 형식은 브라우저에서 열 수 없어요. MP4로 바꿔서 다시 시도해 주세요.'));
     });
+    await ensureDuration(v);
+    this.detectedRect = null;
+    $('#crop-row').hidden = true;
+    try {
+      const p = await import('./processor.js');
+      this.detectedRect = await p.detectContentRect(v, 0, v.duration);
+      await p.seek(v, 0);
+    } catch (err) { console.warn('border detection failed', err); }
+    if (this.detectedRect) {
+      $('#crop-row').hidden = false;
+      $('#auto-crop').checked = true;
+      $('#crop-label').textContent = `검은 테두리 잘라내기 (${this.detectedRect.w}×${this.detectedRect.h}만 사용)`;
+    }
     this.start = 0;
     this.end = v.duration;
     $('#scrub').max = String(v.duration);
@@ -282,9 +304,10 @@ const create = {
       v.pause();
       btn.textContent = '사람 찾는 중…';
       await p.seek(v, this.start + 0.02);
-      const [aw, ah] = p.analysisSize(v);
+      const r = this.rect();
+      const [aw, ah] = p.analysisSize(r);
       const c = document.createElement('canvas'); c.width = aw; c.height = ah;
-      c.getContext('2d').drawImage(v, 0, 0, aw, ah);
+      c.getContext('2d').drawImage(v, r.x, r.y, r.w, r.h, 0, 0, aw, ah);
       this.persons = await p.detect(c);
       if (!this.persons.length) {
         throw new Error('시작 장면에서 사람을 찾지 못했어요. 시작 지점을 멤버가 잘 보이는 곳으로 옮겨 주세요.');
@@ -309,10 +332,11 @@ const create = {
   drawPick() {
     const v = $('#src-video');
     const c = $('#pick-canvas');
-    const s = Math.min(1, 1280 / Math.max(v.videoWidth, v.videoHeight));
-    c.width = Math.round(v.videoWidth * s); c.height = Math.round(v.videoHeight * s);
+    const rect = this.rect();
+    const s = Math.min(1, 1280 / Math.max(rect.w, rect.h));
+    c.width = Math.round(rect.w * s); c.height = Math.round(rect.h * s);
     const ctx = c.getContext('2d');
-    ctx.drawImage(v, 0, 0, c.width, c.height);
+    ctx.drawImage(v, rect.x, rect.y, rect.w, rect.h, 0, 0, c.width, c.height);
     // Dim everyone, then tint each person: pink for the chosen one, blue for the rest.
     ctx.fillStyle = 'rgba(8,6,12,.45)';
     ctx.fillRect(0, 0, c.width, c.height);
@@ -331,7 +355,7 @@ const create = {
       if (chosen) {
         // Re-draw her un-dimmed so she pops.
         mctx.globalCompositeOperation = 'source-in';
-        mctx.drawImage(v, 0, 0, p.w, p.h);
+        mctx.drawImage(v, rect.x, rect.y, rect.w, rect.h, 0, 0, p.w, p.h);
         ctx.globalAlpha = 0.75;
         ctx.drawImage(m, 0, 0, c.width, c.height);
         ctx.globalAlpha = 1;
@@ -349,7 +373,7 @@ const create = {
     const v = $('#src-video');
     const p = this.pickApi;
     const opts = {
-      file: this.file, video: v, start: this.start, end: this.end, target: this.target,
+      file: this.file, video: v, start: this.start, end: this.end, target: this.target, rect: this.rect(),
       fps: Number($('#fps').value), maxSide: Number($('#quality').value),
       withAudio: $('#with-audio').checked,
     };
@@ -446,7 +470,142 @@ $('#pick-canvas').addEventListener('click', e => {
   create.drawPick();
 });
 $('#btn-start').addEventListener('click', () => create.run());
+$('#auto-crop').addEventListener('change', () => create.reset());
 $('#btn-cancel').addEventListener('click', () => create.abort?.abort());
+
+// ---------------------------------------------------------------------------
+// YouTube: the browser can't download from YouTube, so we record it while it plays.
+// Desktop Chrome/Edge records the YouTube tab directly; phones use built-in screen recording.
+
+// MediaRecorder files often have no duration until the browser has scanned to the end.
+async function ensureDuration(v) {
+  if (isFinite(v.duration) && v.duration > 0) return;
+  await new Promise(resolve => {
+    const done = () => { v.removeEventListener('durationchange', check); clearTimeout(timer); resolve(); };
+    const check = () => { if (isFinite(v.duration)) done(); };
+    const timer = setTimeout(done, 8000);
+    v.addEventListener('durationchange', check);
+    v.currentTime = 1e7;
+  });
+  v.currentTime = 0;
+  if (!isFinite(v.duration)) throw new Error('영상 길이를 알 수 없어요. 다시 녹화해 주세요.');
+}
+
+function parseYouTube(text) {
+  const m = text.trim().match(
+    /(?:youtube\.com\/(?:watch\?(?:.*&)?v=|shorts\/|live\/|embed\/|v\/)|youtu\.be\/)([\w-]{11})/i);
+  return m ? m[1] : null;
+}
+
+const isTouchDevice = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
+  || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const canCaptureTab = !!navigator.mediaDevices?.getDisplayMedia && !isTouchDevice
+  && typeof MediaRecorder !== 'undefined';
+
+const capture = {
+  recorder: null, stream: null, chunks: [], startedAt: 0, timer: null, videoId: null,
+
+  showHelp(id) {
+    this.videoId = id;
+    const watch = `https://www.youtube.com/watch?v=${id}`;
+    const help = $('#yt-help');
+    help.hidden = false;
+    if (canCaptureTab) {
+      help.innerHTML = `
+        <ol>
+          <li><b>유튜브 탭 열기</b> <a id="yt-open" href="${watch}" target="_blank" rel="noopener">이 링크</a>를 새 탭에서 열고, 화질을 가장 높게 맞춘 다음 일시정지해 두세요.</li>
+          <li><b>녹화 시작</b> 아래 버튼을 누르고 방금 연 유튜브 탭을 고르세요. <b>"탭 오디오도 공유"</b>를 켜야 노래가 같이 녹음돼요.</li>
+          <li><b>재생</b> 유튜브 탭에서 <b>전체화면(F 키)</b>으로 처음부터 재생하세요. 전체화면이어야 화면 속 영상만 깔끔하게 녹화돼요.</li>
+          <li><b>녹화 끝</b> 다 보면 이 탭으로 돌아와서 "녹화 끝"을 누르세요. 앞뒤 남는 부분은 다음 화면에서 잘라 내면 돼요.</li>
+        </ol>
+        <div class="row" id="rec-controls">
+          <button id="rec-start" class="btn primary" type="button">녹화 시작</button>
+        </div>`;
+      $('#rec-start').onclick = () => this.start();
+    } else {
+      help.innerHTML = `
+        <ol>
+          <li><b>유튜브에서 열기</b> <a href="${watch}" target="_blank" rel="noopener">이 링크</a>를 눌러 유튜브 앱에서 여세요.</li>
+          <li><b>화면 녹화 켜기</b> iPhone·iPad: 제어 센터 → 화면 기록 버튼. 갤럭시 등 안드로이드: 빠른 설정 → 화면 녹화(소리는 "미디어 소리" 선택).</li>
+          <li><b>전체화면으로 재생</b> 영상을 전체화면으로 끝까지 재생하고 녹화를 멈추세요.</li>
+          <li><b>불러오기</b> 이 화면으로 돌아와 위의 "직캠 영상 고르기"에서 방금 녹화한 영상을 고르세요. 검은 테두리는 자동으로 잘라 내요.</li>
+        </ol>
+        <p class="hint">휴대폰 브라우저는 다른 앱 화면을 직접 녹화할 수 없어서, 기기의 화면 녹화 기능을 써야 해요. PC의 Chrome이나 Edge에서는 이 앱이 유튜브 탭을 바로 녹화해요.</p>`;
+    }
+  },
+
+  async start() {
+    const ask = audio => navigator.mediaDevices.getDisplayMedia({
+      video: { frameRate: { ideal: 30 } },
+      audio: audio && { suppressLocalAudioPlayback: false },
+      preferCurrentTab: false,
+      selfBrowserSurface: 'exclude',
+      surfaceSwitching: 'exclude',
+    });
+    let stream;
+    try {
+      try {
+        stream = await ask(true);
+      } catch (err) {
+        if (err.name === 'NotAllowedError') throw err;
+        stream = await ask(false); // some systems can't capture audio at all
+      }
+    } catch (err) {
+      if (err.name !== 'NotAllowedError') toast('녹화를 시작할 수 없어요: ' + err.message, 4000);
+      return;
+    }
+    if (!stream.getAudioTracks().length) toast('소리 없이 녹화돼요. 노래도 담으려면 "탭 오디오도 공유"를 켜고 다시 시작하세요.', 5000);
+    const type = ['video/mp4;codecs=avc1,mp4a.40.2', 'video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm']
+      .find(t => MediaRecorder.isTypeSupported(t)) || '';
+    this.stream = stream;
+    this.chunks = [];
+    this.recorder = new MediaRecorder(stream, { mimeType: type, videoBitsPerSecond: 10_000_000, audioBitsPerSecond: 192_000 });
+    this.recorder.ondataavailable = e => { if (e.data.size) this.chunks.push(e.data); };
+    this.recorder.onstop = () => this.finish();
+    // Chrome's "공유 중지" bar ends the track: treat it like pressing 녹화 끝.
+    stream.getVideoTracks()[0].addEventListener('ended', () => this.stop());
+    this.recorder.start(1000);
+    this.startedAt = Date.now();
+    keepAwake(true);
+    const ctl = $('#rec-controls');
+    ctl.innerHTML = `<span class="mono"><span class="rec-dot"></span><span id="rec-time">0:00</span> 녹화 중</span>
+      <button id="rec-stop" class="btn primary" type="button">녹화 끝</button>`;
+    $('#rec-stop').onclick = () => this.stop();
+    this.timer = setInterval(() => { $('#rec-time').textContent = fmtTime((Date.now() - this.startedAt) / 1000); }, 500);
+  },
+
+  stop() {
+    if (this.recorder?.state === 'recording') this.recorder.stop();
+    this.stream?.getTracks().forEach(t => t.stop());
+  },
+
+  async finish() {
+    clearInterval(this.timer);
+    keepAwake(false);
+    const type = this.recorder.mimeType || 'video/webm';
+    const blob = new Blob(this.chunks, { type });
+    this.recorder = this.stream = null;
+    this.chunks = [];
+    this.showHelp(this.videoId);
+    if (blob.size < 1000) { toast('녹화된 내용이 없어요.'); return; }
+    const ext = type.includes('mp4') ? 'mp4' : 'webm';
+    const file = new File([blob], `youtube-${this.videoId}.${ext}`, { type });
+    try {
+      await create.load(file);
+      toast('녹화 완료! 구간을 다듬고 멤버를 골라 주세요.', 3600);
+    } catch (err) {
+      $('#create-error').textContent = err.message;
+      $('#create-error').hidden = false;
+    }
+  },
+};
+
+$('#yt-form').addEventListener('submit', e => {
+  e.preventDefault();
+  const id = parseYouTube($('#yt-url').value);
+  if (!id) { toast('유튜브 영상 링크가 아니에요. 공유 버튼으로 복사한 링크를 붙여 넣어 주세요.', 4000); return; }
+  capture.showHelp(id);
+});
 
 // ---------------------------------------------------------------------------
 // Stage: the "wallpaper" where clips dance

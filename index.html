@@ -65,6 +65,15 @@
         <small>MP4 · MOV · WebM. 세로 직캠이 가장 잘 돼요.</small>
       </label>
 
+      <section id="yt" class="yt" aria-labelledby="yt-title">
+        <h2 id="yt-title" class="label">유튜브 링크로 가져오기</h2>
+        <form id="yt-form" class="yt-row">
+          <input id="yt-url" type="text" inputmode="url" autocomplete="off" placeholder="youtube.com/shorts/… 또는 youtu.be/… 붙여넣기">
+          <button class="btn" type="submit">가져오기</button>
+        </form>
+        <div id="yt-help" class="yt-help" hidden></div>
+      </section>
+
       <div id="step-edit" class="create-grid" hidden>
         <div class="media">
           <div class="media-frame">
@@ -119,6 +128,7 @@
           </div>
 
           <label class="check"><input id="with-audio" type="checkbox" checked> 노래 소리도 같이 저장</label>
+          <label id="crop-row" class="check" hidden><input id="auto-crop" type="checkbox" checked> <span id="crop-label">검은 테두리 잘라내기</span></label>
 
           <button id="btn-pick" class="btn primary wide" type="button">멤버 고르기</button>
           <button id="btn-start" class="btn primary wide" type="button" hidden>이 멤버로 추출 시작</button>
