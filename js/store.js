@@ -21,8 +21,8 @@ async function run(storeName, mode, fn) {
   const d = await db();
   return new Promise((resolve, reject) => {
     const tx = d.transaction(storeName, mode);
-    const result = fn(tx.objectStore(storeName));
-    tx.oncomplete = () => resolve(result?.result ?? result);
+    const req = fn(tx.objectStore(storeName));
+    tx.oncomplete = () => resolve(req.result);
     tx.onerror = () => reject(tx.error);
     tx.onabort = () => reject(tx.error);
   });

@@ -25,6 +25,7 @@
     <header class="topbar">
       <h1 class="brand">직캠 스테이지</h1>
       <div class="row">
+        <button id="btn-sync" class="btn ghost" type="button">기기 동기화</button>
         <button id="btn-import" class="btn ghost" type="button">파일 가져오기</button>
         <button id="btn-open-stage" class="btn ghost" type="button">무대 열기</button>
       </div>
@@ -38,6 +39,42 @@
         </span>
       </button>
       <p id="support-warning" class="notice" hidden></p>
+      <p id="sync-status" class="sync-status" hidden></p>
+
+      <section id="sync-panel" class="sync" hidden aria-labelledby="sync-title">
+        <div class="sync-head">
+          <h2 id="sync-title" class="section-title">기기 동기화</h2>
+          <button id="sync-close" class="btn ghost small" type="button">닫기</button>
+        </div>
+
+        <div id="sync-setup">
+          <p class="hint">폰, 패드, 컴퓨터가 같은 클립을 보도록 내 GitHub의 <b>비공개 저장소</b>에 클립을 올려 둬요. 처음 한 번만 설정하면 돼요.</p>
+          <ol class="steps">
+            <li><b>비공개 저장소 만들기</b> <a href="https://github.com/new?name=fancam-clips&amp;visibility=private" target="_blank" rel="noopener">여기</a>를 열고 <b>Private</b>인지 확인한 뒤 Create repository를 누르세요.</li>
+            <li><b>토큰 만들기</b> <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">여기</a>에서 Repository access를 <b>Only select repositories → fancam-clips</b>로 고르고, Permissions의 <b>Contents</b>를 <b>Read and write</b>로 바꾼 뒤 Generate token. 나온 토큰을 복사하세요.</li>
+            <li><b>아래에 붙여 넣고 연결</b>. 다른 기기는 연결된 기기에서 만든 링크만 열면 돼요.</li>
+          </ol>
+          <form id="sync-form" class="sync-form">
+            <label class="label" for="sync-repo">저장소 이름</label>
+            <input id="sync-repo" type="text" value="fancam-clips" autocomplete="off" autocapitalize="off" spellcheck="false">
+            <label class="label" for="sync-token">토큰</label>
+            <input id="sync-token" type="password" placeholder="github_pat_…" autocomplete="off" autocapitalize="off" spellcheck="false">
+            <button id="sync-connect" class="btn primary" type="submit">연결</button>
+          </form>
+        </div>
+
+        <div id="sync-connected" hidden>
+          <p><span class="ok-dot" aria-hidden="true"></span><b id="sync-repo-name"></b>에 연결됐어요. 클립을 만들거나 지우면 다른 기기에도 똑같이 반영돼요.</p>
+          <div class="row">
+            <button id="sync-now" class="btn primary" type="button">지금 동기화</button>
+            <button id="sync-link" class="btn ghost" type="button">다른 기기 연결 링크 복사</button>
+            <button id="sync-off" class="btn ghost danger" type="button">이 기기 연결 끊기</button>
+          </div>
+          <input id="sync-link-text" type="text" readonly hidden aria-label="연결 링크">
+          <p class="hint">연결 링크에는 토큰이 들어 있어요. 카카오톡 나와의 채팅처럼 나만 보는 곳으로 보내서, 그 기기에서 열면 바로 연결돼요.
+            저장소에 클립 1개당 보통 수십 MB가 쌓여요. 지운 클립도 GitHub 기록에는 남아서 용량이 줄지는 않아요.</p>
+        </div>
+      </section>
       <h2 class="section-title">내 클립 <span id="clip-count" class="count"></span></h2>
       <div id="clip-grid" class="grid"></div>
       <div id="empty-library" class="empty" hidden>

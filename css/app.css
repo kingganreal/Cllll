@@ -118,6 +118,26 @@ button, input, select { font: inherit; color: inherit; }
 .error { margin: 0; color: var(--danger); }
 .hint { margin: 0; font-size: 13px; color: var(--muted); }
 
+/* ---------- sync ---------- */
+.sync { display: grid; gap: 12px; padding: 16px; border-radius: var(--radius); background: var(--panel); border: 1px solid var(--line); }
+.sync-head { display: flex; justify-content: space-between; align-items: center; }
+.sync-head .section-title { margin: 0; }
+.sync p { margin: 0; max-width: 70ch; }
+.sync .hint b { color: var(--text); }
+.steps { margin: 0; padding-left: 1.3em; display: grid; gap: 8px; color: var(--muted); max-width: 70ch; }
+.steps b { color: var(--text); font-weight: 600; }
+.sync a { color: var(--cool); }
+.sync-form { display: grid; gap: 6px; max-width: 420px; padding-top: 4px; }
+.sync-form input { width: 100%; padding: 9px 12px; border-radius: 10px; border: 1px solid var(--line); background: var(--ink); }
+.sync-form .btn { margin-top: 8px; justify-self: start; }
+#sync-link-text { width: 100%; padding: 9px 12px; border-radius: 10px; border: 1px solid var(--line); background: var(--ink); font: 12px var(--mono); }
+.ok-dot { display: inline-block; width: .55em; height: .55em; border-radius: 50%; background: #7be0a8; margin-right: .45em; vertical-align: .1em; }
+.sync-status { margin: 0; font-size: 13px; color: var(--muted); display: flex; gap: 8px; align-items: center; }
+.sync-status.busy::before { content: ""; width: 10px; height: 10px; border-radius: 50%; border: 2px solid var(--cool); border-right-color: transparent; animation: spin .8s linear infinite; }
+.sync-status.error { color: var(--danger); }
+@keyframes spin { to { transform: rotate(360deg); } }
+.sync-badge { color: var(--cool); }
+
 /* ---------- create ---------- */
 .yt { display: grid; gap: 8px; padding: 14px 16px; border-radius: var(--radius); background: var(--panel); border: 1px solid var(--line); }
 .yt h2 { margin: 0; font-weight: 400; }
