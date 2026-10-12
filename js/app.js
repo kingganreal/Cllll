@@ -520,7 +520,7 @@ const create = {
       btn.textContent = '사람 찾는 중…';
       await p.seek(v, this.start + 0.02);
       const r = this.rect();
-      const [aw, ah] = p.analysisSize(r);
+      const [aw, ah] = p.analysisSize(r, Number($('#quality').value));
       const c = document.createElement('canvas'); c.width = aw; c.height = ah;
       c.getContext('2d').drawImage(v, r.x, r.y, r.w, r.h, 0, 0, aw, ah);
       this.persons = await p.detect(c);
@@ -592,7 +592,8 @@ const create = {
       fps: Number($('#fps').value), maxSide: Number($('#quality').value),
       withAudio: $('#with-audio').checked,
     };
-    opts.bitrate = Math.round(opts.maxSide * opts.maxSide * 2.2 * opts.fps / 30); // ~4–7 Mbps
+    // ~4 Mbps at 960, ~7 at 1280, ~12 at 1920 (30fps)
+    opts.bitrate = Math.round(opts.maxSide * opts.maxSide * (opts.maxSide >= 1920 ? 3.2 : 2.2) * opts.fps / 30);
     const name = $('#clip-name').value.trim() || '설윤';
 
     this.busy = true;
@@ -687,6 +688,8 @@ $('#pick-canvas').addEventListener('click', e => {
 });
 $('#btn-start').addEventListener('click', () => create.run());
 $('#auto-crop').addEventListener('change', () => create.reset());
+// The pick is analysed at a size that depends on quality, so re-pick after changing it.
+$('#quality').addEventListener('change', () => { if (create.persons) create.reset(); });
 $('#btn-cancel').addEventListener('click', () => create.abort?.abort());
 
 // ---------------------------------------------------------------------------

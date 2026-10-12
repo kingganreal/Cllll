@@ -5,7 +5,9 @@
 import { PoseLandmarker } from '../vendor/mediapipe/vision_bundle.mjs';
 import { Muxer, StreamTarget } from '../vendor/mp4-muxer/mp4-muxer.mjs';
 
-const ANALYSIS_SIDE = 640; // longest side of the frame fed to the segmentation model
+// Longest side of the frame fed to the segmentation model. Full-HD output gets a finer
+// matte so edges stay crisp after upscaling.
+const analysisSide = maxSide => (maxSide >= 1920 ? 960 : 640);
 const GRID = 4;            // stride for the coarse masks used to track a person
 
 // ---------------------------------------------------------------------------
@@ -230,8 +232,8 @@ export function fullRect(video) {
   return { x: 0, y: 0, w: video.videoWidth, h: video.videoHeight };
 }
 
-export function analysisSize(rect) {
-  return fitSize(rect.w, rect.h, ANALYSIS_SIDE);
+export function analysisSize(rect, maxSide) {
+  return fitSize(rect.w, rect.h, analysisSide(maxSide));
 }
 
 // Finds black bars (letterboxing, screen-recording borders) by sampling a few frames.
@@ -363,7 +365,7 @@ async function encodeAudio(audio, muxer) {
 export async function extract(o) {
   const { video, start, end, fps, signal } = o;
   const r = o.rect ?? fullRect(video);
-  const [aw, ah] = analysisSize(r);
+  const [aw, ah] = analysisSize(r, o.maxSide);
   const [hw, hh] = fitSize(r.w, r.h, o.maxSide);
   // Portrait fancams pack side-by-side, landscape ones top/bottom, keeping frames squarish.
   const layout = hh >= hw ? 'sbs' : 'tb';
