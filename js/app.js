@@ -1,6 +1,7 @@
 import { clips, kv, requestPersistence } from './store.js';
 import { AlphaClip } from './player.js';
 import * as sync from './sync.js';
+import * as pcHelper from './helper.js';
 
 const $ = sel => document.querySelector(sel);
 const fmtTime = s => {
@@ -730,7 +731,7 @@ const capture = {
     const help = $('#yt-help');
     help.hidden = false;
     if (canCaptureTab) {
-      help.innerHTML = `
+      const record = `
         <ol>
           <li><b>유튜브 탭 열기</b> <a id="yt-open" href="${watch}" target="_blank" rel="noopener">이 링크</a>를 새 탭에서 열고, 화질을 가장 높게 맞춘 다음 일시정지해 두세요.</li>
           <li><b>녹화 시작</b> 아래 버튼을 누르고 방금 연 유튜브 탭을 고르세요. <b>"탭 오디오도 공유"</b>를 켜야 노래가 같이 녹음돼요.</li>
@@ -738,8 +739,20 @@ const capture = {
           <li><b>녹화 끝</b> 다 보면 이 탭으로 돌아와서 "녹화 끝"을 누르세요. 앞뒤 남는 부분은 다음 화면에서 잘라 내면 돼요.</li>
         </ol>
         <div class="row" id="rec-controls">
-          <button id="rec-start" class="btn primary" type="button">녹화 시작</button>
+          <button id="rec-start" class="btn ${pcHelper.isWindowsDesktop ? 'ghost' : 'primary'}" type="button">녹화 시작</button>
         </div>`;
+      if (pcHelper.isWindowsDesktop) {
+        // The PC helper gets the original file (up to 4K); recording stays as a fallback.
+        help.innerHTML = `
+          <div id="helper-box" class="helper-box"></div>
+          <details class="alt">
+            <summary>또는 화면 녹화로 가져오기 (화질이 화면 크기로 제한돼요)</summary>
+            ${record}
+          </details>`;
+        youtubeHelper.show(watch);
+      } else {
+        help.innerHTML = record;
+      }
       $('#rec-start').onclick = () => this.start();
     } else {
       help.innerHTML = `
@@ -815,6 +828,105 @@ const capture = {
     } catch (err) {
       $('#create-error').textContent = err.message;
       $('#create-error').hidden = false;
+    }
+  },
+};
+
+// Windows PC helper: downloads the original YouTube file (up to 4K) and hands it to the editor.
+const youtubeHelper = {
+  url: null, checkTimer: null, busy: false,
+
+  async show(url) {
+    this.url = url;
+    clearInterval(this.checkTimer);
+    this.render('checking');
+    if (await pcHelper.isRunning()) { this.render('ready'); return; }
+    this.render('off');
+    // Notice the helper as soon as it's started, without a click.
+    this.checkTimer = setInterval(async () => {
+      if (!document.body.contains($('#helper-box'))) { clearInterval(this.checkTimer); return; }
+      if (await pcHelper.isRunning()) { clearInterval(this.checkTimer); this.render('ready'); }
+    }, 3000);
+  },
+
+  render(state, info = {}) {
+    const box = $('#helper-box');
+    if (!box) return;
+    const head = '<p class="helper-title"><b>4K 원본으로 받기</b> <span class="pill">추천</span></p>';
+    if (state === 'checking') {
+      box.innerHTML = head + '<p class="hint">PC 도우미를 찾는 중…</p>';
+    } else if (state === 'off') {
+      box.innerHTML = head + `
+        <p class="hint">PC 도우미가 유튜브 원본 파일을 받아 줘요. 처음 한 번만 설치하면 돼요.</p>
+        <ol>
+          <li><b>도우미 받기</b> <button id="helper-get" class="btn small" type="button">FancamStage-Helper.bat 받기</button></li>
+          <li><b>더블클릭해서 실행</b> "Windows의 PC 보호" 창이 뜨면 <b>추가 정보 → 실행</b>을 누르세요.
+            처음엔 필요한 프로그램(200MB 정도)을 받느라 몇 분 걸려요.</li>
+          <li><b>검은 창에 "준비 완료"가 뜨면</b> 여기가 자동으로 바뀌어요. 그 창은 켜 둔 채로 두세요.</li>
+        </ol>
+        <p class="hint">켰는데도 그대로라면, 주소창 왼쪽 아이콘을 눌러 <b>로컬 네트워크 접근</b>을 허용해 주세요.</p>`;
+      $('#helper-get').onclick = () => {
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(pcHelper.launcherFile());
+        a.download = 'FancamStage-Helper.bat';
+        document.body.append(a); a.click(); a.remove();
+        setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+      };
+    } else if (state === 'ready') {
+      box.innerHTML = head + `
+        <p class="hint"><span class="ok-dot"></span>PC 도우미가 켜져 있어요. 유튜브에 있는 가장 좋은 화질(최대 4K)로 받아요.</p>
+        <div class="row"><button id="helper-start" class="btn primary" type="button">원본 받기</button></div>`;
+      $('#helper-start').onclick = () => this.download();
+    } else if (state === 'working') {
+      box.innerHTML = head + `
+        <div class="bar"><span style="width:${(info.progress * 100).toFixed(1)}%"></span></div>
+        <p class="mono helper-progress"></p>`;
+      box.querySelector('.helper-progress').textContent = info.text;
+    } else if (state === 'error') {
+      box.innerHTML = head + '<p class="error"></p><div class="row"><button id="helper-retry" class="btn" type="button">다시 시도</button></div>';
+      box.querySelector('.error').textContent = info.text;
+      $('#helper-retry').onclick = () => this.show(this.url);
+    }
+  },
+
+  async download() {
+    if (this.busy) return;
+    this.busy = true;
+    keepAwake(true);
+    let id = null;
+    try {
+      id = await pcHelper.startDownload(this.url);
+      let st;
+      for (;;) {
+        await new Promise(r => setTimeout(r, 1000));
+        st = await pcHelper.jobState(id);
+        if (st.state === 'done') break;
+        if (st.state === 'error') throw new Error(st.error.replace(/^ERROR:\s*/, ''));
+        if (st.state === 'missing') throw new Error('도우미가 다시 시작돼서 작업이 사라졌어요.');
+        const what = st.state === 'merging' ? '영상과 소리 합치는 중…'
+          : `${st.part > 1 ? '소리' : '영상'} 받는 중 ${Math.round(st.percent)}%`;
+        // Video is most of the bytes: count it as 0–85%, audio 85–95%, merging the rest.
+        const progress = st.state === 'merging' ? 0.97 : (st.part > 1 ? 0.85 + st.percent / 1000 : st.percent / 100 * 0.85);
+        this.render('working', { progress, text: (st.title ? st.title + '\n' : '') + what });
+      }
+      const file = await pcHelper.fetchFile(id, st.title, st.ext, f =>
+        this.render('working', { progress: 1, text: `앱으로 옮기는 중 ${Math.round(f * 100)}%` }));
+      pcHelper.finish(id);
+      id = null;
+      await create.load(file);
+      const v = $('#src-video');
+      if (Math.max(v.videoWidth, v.videoHeight) >= 2000) {
+        $('#quality').value = '1920';
+        toast('4K 원본이라 화질을 "FHD · 4K 원본용"으로 맞췄어요. 구간을 다듬고 멤버를 골라 주세요.', 4200);
+      } else {
+        toast('받았어요! 구간을 다듬고 멤버를 골라 주세요.', 3600);
+      }
+    } catch (err) {
+      if (id) pcHelper.finish(id);
+      this.render('error', { text: '받지 못했어요: ' + err.message });
+    } finally {
+      this.busy = false;
+      keepAwake(false);
     }
   },
 };

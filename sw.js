@@ -1,7 +1,7 @@
 // Offline support: cache the app shell, the AI model and its runtime after first use.
-const CACHE = 'fancam-stage-v3';
+const CACHE = 'fancam-stage-v4';
 const SHELL = [
-  './', 'index.html', 'css/app.css', 'js/app.js', 'js/store.js', 'js/player.js', 'js/processor.js', 'js/sync.js',
+  './', 'index.html', 'css/app.css', 'js/app.js', 'js/store.js', 'js/player.js', 'js/processor.js', 'js/sync.js', 'js/helper.js',
   'manifest.webmanifest', 'icons/icon.svg', 'icons/icon-192.png', 'icons/icon-512.png',
 ];
 
