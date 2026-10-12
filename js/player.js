@@ -31,11 +31,15 @@ void main() {
 }`;
 
 export class AlphaClip {
-  /** @param {{blob: Blob, layout: string, crop: object, width: number, height: number}} clip */
-  constructor(clip) {
+  /**
+   * @param {{blob?: Blob, src?: string, layout: string, crop: object, width: number, height: number}} clip
+   * @param {{readable?: boolean}} [opts] readable keeps the last frame so alphaAt() can read it
+   */
+  constructor(clip, opts = {}) {
     this.clip = clip;
     this.flip = false;
-    this.url = URL.createObjectURL(clip.blob);
+    this.ownsUrl = !clip.src;
+    this.url = clip.src || URL.createObjectURL(clip.blob);
 
     const video = this.video = document.createElement('video');
     video.src = this.url;
@@ -48,7 +52,7 @@ export class AlphaClip {
 
     const canvas = this.canvas = document.createElement('canvas');
     canvas.className = 'clip-canvas';
-    const gl = this.gl = canvas.getContext('webgl', { premultipliedAlpha: true, alpha: true, antialias: false })
+    const gl = this.gl = canvas.getContext('webgl', { premultipliedAlpha: true, alpha: true, antialias: false, preserveDrawingBuffer: !!opts.readable })
       || canvas.getContext('experimental-webgl');
     if (!gl) throw new Error('WebGL을 쓸 수 없는 브라우저예요.');
     this.#initGL();
@@ -133,6 +137,18 @@ export class AlphaClip {
 
   setFlip(f) { this.flip = f; this.draw(); }
 
+  // Opacity (0–255) of the drawn pixel under a point in CSS pixels; needs { readable: true }.
+  alphaAt(cssX, cssY) {
+    const { gl, canvas } = this;
+    const r = canvas.getBoundingClientRect();
+    const x = Math.floor((cssX - r.left) * canvas.width / r.width);
+    const y = canvas.height - 1 - Math.floor((cssY - r.top) * canvas.height / r.height);
+    if (x < 0 || y < 0 || x >= canvas.width || y >= canvas.height) return 0;
+    const px = new Uint8Array(4);
+    gl.readPixels(x, y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    return px[3];
+  }
+
   play() { return this.video.play().catch(() => {}); }
 
   destroy() {
@@ -140,7 +156,7 @@ export class AlphaClip {
     this.video.pause();
     this.video.removeAttribute('src');
     this.video.load();
-    URL.revokeObjectURL(this.url);
+    if (this.ownsUrl) URL.revokeObjectURL(this.url);
     this.gl.getExtension('WEBGL_lose_context')?.loseContext();
   }
 }

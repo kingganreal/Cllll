@@ -81,6 +81,10 @@ const library = {
     $('#clip-count').textContent = list.length ? String(list.length) : '';
     $('#empty-library').hidden = list.length > 0;
     for (const c of list) grid.append(this.card(c));
+    // With the Windows app running, clips can go straight onto the desktop.
+    if (await pcHelper.desktopRunning()) {
+      for (const b of grid.querySelectorAll('[data-a=desktop]')) b.hidden = false;
+    }
   },
 
   card(c) {
@@ -104,6 +108,7 @@ const library = {
       <div class="card-meta sync-badge" data-sync="${c.id}">${cloud.on ? (c.inDrive ? '모든 기기에 있음' : '올리기 대기') : ''}</div></div>
       <div class="card-actions">
         <button class="btn primary" type="button" data-a="stage">무대로</button>
+        <button class="btn ghost" type="button" data-a="desktop" hidden>바탕화면에</button>
         <button class="btn ghost" type="button" data-a="rename">이름</button>
         <button class="btn ghost" type="button" data-a="save">저장</button>
         <button class="btn ghost danger" type="button" data-a="delete">삭제</button>
@@ -115,6 +120,7 @@ const library = {
       if (!b) return;
       const a = b.dataset.a;
       if (a === 'stage') stage.addAndOpen(c.id);
+      if (a === 'desktop') sendToDesktop(c, b);
       if (a === 'save') downloadClip(c);
       if (a === 'rename') {
         const input = document.createElement('input');
@@ -159,6 +165,19 @@ const library = {
     return el;
   },
 };
+
+async function sendToDesktop(c, button) {
+  const label = button?.textContent;
+  try {
+    const full = (await clips.get(c.id)) || c;
+    await pcHelper.sendToDesktop(full, f => { if (button) button.textContent = `보내는 중 ${Math.round(f * 100)}%`; });
+    toast('바탕화면에 띄웠어요. 끌어서 옮기고, 오른쪽 클릭으로 설정을 바꿀 수 있어요.', 4200);
+  } catch (err) {
+    toast(err.message, 4500);
+  } finally {
+    if (button) button.textContent = label;
+  }
+}
 
 function downloadClip(c) {
   const a = document.createElement('a');
@@ -912,14 +931,14 @@ const youtubeHelper = {
       box.innerHTML = head + '<p class="hint">PC 도우미를 찾는 중…</p>';
     } else if (state === 'off') {
       box.innerHTML = head + `
-        <p class="hint">PC 도우미가 유튜브 원본 파일을 받아 줘요. 처음 한 번만 설치하면 돼요.</p>
+        <p class="hint">직캠 스테이지 윈도우 앱이 유튜브 원본 파일을 받아 줘요. 클립을 바탕화면에 띄우는 것도 이 앱이 해요.</p>
         <ol>
-          <li><b>도우미 받기</b> <button id="helper-get" class="btn small" type="button">FancamStage-Helper.bat 받기</button></li>
-          <li><b>더블클릭해서 실행</b> "Windows의 PC 보호" 창이 뜨면 <b>추가 정보 → 실행</b>을 누르세요.
-            처음엔 필요한 프로그램(200MB 정도)을 받느라 몇 분 걸려요.</li>
-          <li><b>검은 창에 "준비 완료"가 뜨면</b> 여기가 자동으로 바뀌어요. 그 창은 켜 둔 채로 두세요.</li>
+          <li><b>윈도우 앱 설치</b> <a href="${pcHelper.DESKTOP_APP_URL}" target="_blank" rel="noopener">여기</a>에서
+            <code>FancamStage-Setup-….exe</code>를 받아 실행하세요. "Windows의 PC 보호" 창이 뜨면 <b>추가 정보 → 실행</b>.</li>
+          <li><b>앱이 켜지면</b> 여기가 자동으로 바뀌어요. 처음 받을 때 필요한 프로그램(200MB 정도)을 받느라 몇 분 걸려요.</li>
         </ol>
-        <p class="hint">켰는데도 그대로라면, 주소창 왼쪽 아이콘을 눌러 <b>로컬 네트워크 접근</b>을 허용해 주세요.</p>`;
+        <p class="hint">켰는데도 그대로라면, 주소창 왼쪽 아이콘을 눌러 <b>로컬 네트워크 접근</b>을 허용해 주세요.
+          앱을 설치하기 싫으면 <button id="helper-get" class="btn small" type="button">도우미 스크립트(.bat)</button>만 써도 돼요.</p>`;
       $('#helper-get').onclick = () => {
         const a = document.createElement('a');
         a.href = URL.createObjectURL(pcHelper.launcherFile());
@@ -1167,6 +1186,7 @@ const stage = {
     this.selected = sp;
     $('#sprite-bar').hidden = !sp;
     if (sp) {
+      pcHelper.desktopRunning().then(on => { $('[data-sprite=desktop]').hidden = !on; });
       $('#sprite-speed').value = String(sp.s.speed || 1);
       const snd = $('#sprite-sound');
       snd.hidden = !sp.data.hasAudio;
@@ -1361,6 +1381,7 @@ $('#sprite-bar').addEventListener('click', e => {
     if (!sp.clip.video.muted) sp.clip.play();
     b.textContent = sp.clip.video.muted ? '소리 켜기' : '소리 끄기';
   }
+  if (act === 'desktop') sendToDesktop(sp.data, b);
   if (act === 'front') {
     $('#stage').append(sp.el);
     stage.state.sprites = [...stage.state.sprites.filter(s => s !== sp.s), sp.s];

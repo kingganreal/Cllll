@@ -24,7 +24,23 @@
 녹화본이나 화면 녹화 파일에 생긴 **검은 테두리는 자동으로 잘라 내요**. 필요 없으면 체크를 끄면 돼요.
 녹화는 실시간이라 영상 길이만큼 걸리고, 화질은 유튜브에서 재생한 화질을 따라가요.
 
-### 윈도우 PC: 도우미로 4K 원본 받기 (추천)
+## 윈도우 앱: 바탕화면에 띄우기
+
+[Releases](https://github.com/kingganreal/Cllll/releases/latest)에서 `FancamStage-Setup-….exe`를 받아 설치하세요
+("Windows의 PC 보호" 창이 뜨면 추가 정보 → 실행). 설치하면 작업 표시줄 오른쪽 트레이에서 조용히 돌아가요.
+
+- 크롬에서 웹앱을 열고 클립의 **바탕화면에**를 누르면, 그 클립이 바탕화면에 배경 없이 떠요. 무대 화면에서도 돼요.
+- 캐릭터는 끌어서 옮기고, 마우스 휠로 크기를 바꿔요. 캐릭터가 없는 투명한 부분은 클릭이 뒤로 통과해요.
+- **오른쪽 클릭**: 좌우 반전, 소리, 속도, 크기, 투명도, 항상 위에, 하나 더 띄우기, 내리기.
+- 띄워 둔 캐릭터는 PC를 다시 켜도 그 자리에 다시 떠요. "윈도우를 켜면 자동으로 실행"을 켜 두면 편해요.
+- 앱이 켜져 있으면 웹앱의 유튜브 원본 받기가 바로 돼요. 따로 도우미를 켤 필요가 없어요.
+
+앱 코드는 `desktop/`에 있어요 (Electron). `desktop/` 또는 `js/player.js`가 바뀌면 GitHub Actions가 윈도우 설치 파일을 만들어
+Releases에 올려요. 새 버전을 내려면 `desktop/package.json`의 `version`을 올리세요.
+
+### 윈도우 PC: 4K 원본 받기 (추천)
+
+윈도우 앱이 켜져 있으면 아래 과정 없이 바로 돼요. 앱을 설치하기 싫을 때는 도우미 스크립트만 써도 돼요.
 
 윈도우 PC의 Chrome이나 Edge에서 유튜브 링크를 넣으면 **PC 도우미**로 원본 파일(최대 4K)을 바로 받을 수 있어요.
 
@@ -108,7 +124,8 @@ js/drive.js         구글 드라이브로 기기 간 동기화
 js/config.js        구글 클라이언트 ID 설정
 js/sync.js          예전 GitHub 동기화 (드라이브로 옮길 때만 사용)
 js/helper.js        윈도우 PC 도우미와 통신
-helper/             윈도우 PC 도우미 (PowerShell, yt-dlp로 유튜브 원본 받기)
+helper/             윈도우 PC 도우미 (PowerShell, 앱 없이 쓸 때)
+desktop/            윈도우 앱 (Electron: 바탕화면 오버레이, 유튜브 받기)
 js/app.js           UI, 무대 조작
 sw.js               오프라인 캐시
 vendor/, models/    MediaPipe tasks-vision 1.0.1, mp4-muxer 5.2.2, pose_landmarker_full 모델

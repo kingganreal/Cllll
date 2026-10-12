@@ -11,17 +11,53 @@ async function call(path, opts = {}) {
   return body;
 }
 
-// Resolves to true when the helper is running and reachable from this page.
-export async function isRunning() {
+export const DESKTOP_APP_URL = 'https://github.com/kingganreal/Cllll/releases/latest';
+
+// The helper's status ({ ok, desktop, ... }) when it's running and reachable, else null.
+export async function status() {
   try {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 1500);
     const s = await call('/status', { signal: ctrl.signal });
     clearTimeout(timer);
-    return !!s.ok;
+    return s.ok ? s : null;
   } catch {
-    return false;
+    return null;
   }
+}
+export const isRunning = async () => !!(await status());
+
+// Is the Windows app (not just the old helper script) running? Cached briefly.
+let desktopCheck = null, desktopCheckedAt = 0;
+export function desktopRunning() {
+  if (!isWindowsDesktop) return Promise.resolve(false);
+  if (!desktopCheck || Date.now() - desktopCheckedAt > 15000) {
+    desktopCheckedAt = Date.now();
+    desktopCheck = status().then(s => !!s?.desktop);
+  }
+  return desktopCheck;
+}
+
+function put(path, body, onProgress) {
+  return new Promise((resolve, reject) => {
+    const x = new XMLHttpRequest();
+    x.open('PUT', BASE + path);
+    if (onProgress) x.upload.onprogress = e => { if (e.lengthComputable) onProgress(e.loaded / e.total); };
+    x.onload = () => (x.status >= 200 && x.status < 300 ? resolve() : reject(new Error(`윈도우 앱 오류 (${x.status})`)));
+    x.onerror = () => reject(new Error('윈도우 앱에 연결할 수 없어요. 앱이 켜져 있는지 확인해 주세요.'));
+    x.send(body);
+  });
+}
+
+// Sends a clip to the Windows app and puts it on the desktop.
+export async function sendToDesktop(clip, onProgress) {
+  const meta = {
+    name: clip.name, layout: clip.layout, crop: clip.crop, width: clip.width, height: clip.height,
+    duration: clip.duration, hasAudio: clip.hasAudio,
+  };
+  await put(`/clips/${encodeURIComponent(clip.id)}?meta=${encodeURIComponent(JSON.stringify(meta))}`, clip.blob, onProgress);
+  if (clip.thumbnail) await put(`/clips/${encodeURIComponent(clip.id)}/thumb`, clip.thumbnail);
+  await call(`/clips/${encodeURIComponent(clip.id)}/show`, { method: 'POST', body: '{}' });
 }
 
 export const startDownload = url => call('/download', {
