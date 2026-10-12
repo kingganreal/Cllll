@@ -1,6 +1,8 @@
 import { clips, kv, requestPersistence } from './store.js';
 import { AlphaClip } from './player.js';
 import * as sync from './sync.js';
+import * as drive from './drive.js';
+import { GOOGLE_CLIENT_ID } from './config.js';
 import * as pcHelper from './helper.js';
 
 const $ = sel => document.querySelector(sel);
@@ -99,7 +101,7 @@ const library = {
     body.innerHTML = `
       <div><div class="card-name"></div>
       <div class="card-meta mono">${fmtTime(c.duration)} · ${c.hasAudio ? '소리 있음' : '소리 없음'} · ${sizeMb}MB</div>
-      <div class="card-meta sync-badge" data-sync="${c.id}">${cloud.cfg ? (c.uploaded ? '모든 기기에 있음' : '올리기 대기') : ''}</div></div>
+      <div class="card-meta sync-badge" data-sync="${c.id}">${cloud.on ? (c.inDrive ? '모든 기기에 있음' : '올리기 대기') : ''}</div></div>
       <div class="card-actions">
         <button class="btn primary" type="button" data-a="stage">무대로</button>
         <button class="btn ghost" type="button" data-a="rename">이름</button>
@@ -127,7 +129,7 @@ const library = {
           const fresh = (await clips.get(c.id)) || c;
           fresh.name = c.name = v;
           fresh.updated = c.updated = Date.now();
-          if (fresh.uploaded) fresh.dirtyMeta = true;
+          if (fresh.inDrive) fresh.dirtyMeta = true;
           await clips.put(fresh);
           cloud.kick();
         };
@@ -139,12 +141,12 @@ const library = {
           const fresh = (await clips.get(c.id)) || c;
           await clips.delete(c.id);
           stage.forget(c.id);
-          if (fresh.uploaded || cloud.running) {
+          if (fresh.inDrive || cloud.running) {
             const pending = (await kv.get('pendingDeletes')) || [];
             await kv.set('pendingDeletes', [...new Set([...pending, c.id])]);
           }
           this.render();
-          toast(cloud.cfg ? '삭제했어요. 다른 기기에서도 지워져요.' : '삭제했어요');
+          toast(cloud.on ? '삭제했어요. 다른 기기에서도 지워져요.' : '삭제했어요');
           cloud.kick();
         } else {
           b.dataset.confirm = '1';
@@ -229,16 +231,19 @@ function packedThumbnail(v, layout, width, height) {
 }
 
 // ---------------------------------------------------------------------------
-// Cloud sync across phone / tablet / computer (see js/sync.js)
+// Cloud sync across phone / tablet / computer through Google Drive (see js/drive.js).
+// Clips synced earlier through GitHub (js/sync.js) are moved over once.
 
 const cloud = {
-  cfg: sync.getConfig(),
   running: false,
   again: false,
   lastRun: 0,
 
+  get on() { return drive.isEnabled(); },
+
   kick() {
-    if (!this.cfg) return;
+    if (!this.on) return;
+    if (!drive.hasToken()) { this.askSignIn(); return; }
     if (this.running) { this.again = true; return; }
     this.run();
   },
@@ -248,6 +253,34 @@ const cloud = {
     el.hidden = !text;
     el.textContent = text;
     el.className = 'sync-status ' + kind;
+  },
+
+  // Google sign-ins last about an hour; renewing one needs a tap (it opens a popup).
+  askSignIn() {
+    const el = $('#sync-status');
+    el.hidden = false;
+    el.className = 'sync-status';
+    el.textContent = '';
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'btn primary';
+    b.textContent = '구글 드라이브와 동기화하기';
+    b.onclick = () => this.signInAndSync();
+    const note = document.createElement('span');
+    note.textContent = '로그인 확인이 필요해요';
+    el.append(b, note);
+    drive.preload().catch(() => {});
+  },
+
+  async signInAndSync() {
+    try {
+      await drive.signIn();
+      this.renderPanel();
+      library.refresh();
+      this.kick();
+    } catch (err) {
+      toast(err.message, 4500);
+    }
   },
 
   badge(id, text) {
@@ -260,10 +293,11 @@ const cloud = {
     try {
       do { this.again = false; await this.pass(); } while (this.again);
       const t = new Date();
-      this.status(`동기화 완료 · ${t.getHours()}:${String(t.getMinutes()).padStart(2, '0')}`);
+      this.status(`드라이브 동기화 완료 · ${t.getHours()}:${String(t.getMinutes()).padStart(2, '0')}`);
     } catch (err) {
       console.error(err);
-      this.status('동기화 실패: ' + err.message + (err.offline ? ' 연결되면 다시 시도해요.' : ''), 'error');
+      if (drive.isSignInError(err)) this.askSignIn();
+      else this.status('동기화 실패: ' + err.message + (err.offline ? ' 연결되면 다시 시도해요.' : ''), 'error');
     } finally {
       this.running = false;
       this.lastRun = Date.now();
@@ -271,15 +305,34 @@ const cloud = {
   },
 
   async pass() {
-    const cfg = this.cfg;
-    this.status('클라우드 확인 중…', 'busy');
-    let { clips: remote } = await sync.listRemote(cfg);
+    this.status('구글 드라이브 확인 중…', 'busy');
+    let remote = await drive.listRemote();
+
+    // 0. One-time move of clips that only exist in the old GitHub sync.
+    const github = sync.getConfig();
+    if (github) {
+      try {
+        const { clips: old } = await sync.listRemote(github);
+        const have = new Set([...(await clips.all()).map(c => c.id), ...remote.map(r => r.id)]);
+        for (const [i, r] of old.filter(r => !have.has(r.id)).entries()) {
+          const label = `GitHub에서 옮기는 중 (${i + 1}) ${r.meta.name}`;
+          this.status(label, 'busy');
+          const rec = await sync.downloadClip(github, r, f => this.status(`${label} ${Math.round(f * 100)}%`, 'busy'));
+          delete rec.uploaded;
+          await clips.put(rec);
+        }
+        sync.setConfig(null);
+        toast('GitHub에 있던 클립을 구글 드라이브로 옮기고 있어요. 다 끝나면 GitHub 저장소는 지워도 돼요.', 5000);
+      } catch (err) {
+        console.warn('GitHub migration skipped', err);
+      }
+    }
 
     // 1. Deletions made on this device.
     const pending = (await kv.get('pendingDeletes')) || [];
     for (const id of pending) {
       const entry = remote.find(r => r.id === id);
-      if (entry) await sync.deleteClip(cfg, entry, entry.meta.name);
+      if (entry) await drive.deleteClip(entry);
     }
     if (pending.length) {
       await kv.set('pendingDeletes', []);
@@ -293,20 +346,20 @@ const cloud = {
     for (const c of local) {
       const r = remoteById.get(c.id);
       if (!r) {
-        if (c.uploaded) { await clips.delete(c.id); stage.forget(c.id); changed = true; }
+        if (c.inDrive) { await clips.delete(c.id); stage.forget(c.id); changed = true; }
         continue;
       }
       const remoteNewer = (r.meta.updated || 0) > (c.updated || 0);
       const localNewer = (c.updated || 0) > (r.meta.updated || 0);
       if (c.dirtyMeta || (localNewer && c.name !== r.meta.name)) {
-        await sync.updateMeta(cfg, c);
+        await drive.updateMeta(c, r);
         c.dirtyMeta = false;
-        c.uploaded = true;
+        c.inDrive = true;
         await clips.put(c);
-      } else if (remoteNewer || !c.uploaded) {
-        c.name = r.meta.name;
+      } else if (remoteNewer || !c.inDrive) {
+        c.name = r.meta.name || c.name;
         c.updated = r.meta.updated;
-        c.uploaded = true;
+        c.inDrive = true;
         await clips.put(c);
         changed = true;
       }
@@ -314,21 +367,21 @@ const cloud = {
     if (changed) library.refresh();
 
     // 3. New clips from this device.
-    const toUpload = local.filter(c => !c.uploaded && !remoteById.has(c.id));
+    const toUpload = (await clips.all()).filter(c => !c.inDrive && !remoteById.has(c.id));
     for (const [i, c] of toUpload.entries()) {
-      const label = `올리는 중 (${i + 1}/${toUpload.length}) ${c.name}`;
+      const label = `드라이브에 올리는 중 (${i + 1}/${toUpload.length}) ${c.name}`;
       this.status(label, 'busy');
-      await sync.uploadClip(cfg, c, f => {
+      await drive.uploadClip(c, f => {
         this.status(`${label} ${Math.round(f * 100)}%`, 'busy');
         this.badge(c.id, `올리는 중 ${Math.round(f * 100)}%`);
       });
       const still = await clips.get(c.id);
       if (still) {
-        still.uploaded = true;
+        still.inDrive = true;
         await clips.put(still);
         this.badge(c.id, '모든 기기에 있음');
       } else {
-        // Deleted while uploading: remove it from the cloud on the next pass.
+        // Deleted while uploading: remove it from Drive on the next pass.
         const p = (await kv.get('pendingDeletes')) || [];
         await kv.set('pendingDeletes', [...p, c.id]);
         this.again = true;
@@ -339,10 +392,11 @@ const cloud = {
     const localIds = new Set((await clips.all()).map(c => c.id));
     const toDownload = remote.filter(r => !localIds.has(r.id));
     for (const [i, r] of toDownload.entries()) {
-      const label = `받는 중 (${i + 1}/${toDownload.length}) ${r.meta.name}`;
+      const label = `받는 중 (${i + 1}/${toDownload.length}) ${r.meta.name || ''}`;
       this.status(label, 'busy');
-      const rec = await sync.downloadClip(cfg, r, f => this.status(`${label} ${Math.round(f * 100)}%`, 'busy'));
-      rec.uploaded = true;
+      const rec = await drive.downloadClip(r, f => this.status(`${label} ${Math.round(f * 100)}%`, 'busy'));
+      rec.inDrive = true;
+      delete rec.uploaded;
       await clips.put(rec);
       requestPersistence();
       library.refresh();
@@ -350,20 +404,15 @@ const cloud = {
   },
 
   renderPanel() {
-    const on = !!this.cfg;
-    $('#sync-setup').hidden = on;
-    $('#sync-connected').hidden = !on;
-    if (on) $('#sync-repo-name').textContent = this.cfg.repo;
+    const hasId = !!drive.clientId();
+    $('#drive-setup').hidden = hasId;
+    $('#drive-signin').hidden = !hasId || (this.on && drive.hasToken());
+    $('#drive-connected').hidden = !(this.on && drive.hasToken());
+    $('#drive-reset').hidden = !!GOOGLE_CLIENT_ID;
+    $('#sync-link').hidden = !!GOOGLE_CLIENT_ID;
+    $('#drive-origin').textContent = location.origin;
     $('#sync-link-text').hidden = true;
-  },
-
-  async connect(cfg) {
-    this.cfg = cfg;
-    sync.setConfig(cfg);
-    // Everything already on this device gets uploaded on the first pass.
-    this.renderPanel();
-    library.refresh();
-    this.kick();
+    drive.preload().catch(() => {}); // the sign-in popup must open straight from a tap
   },
 };
 
@@ -373,36 +422,28 @@ $('#btn-sync').addEventListener('click', () => {
   cloud.renderPanel();
 });
 $('#sync-close').addEventListener('click', () => { $('#sync-panel').hidden = true; });
-$('#sync-form').addEventListener('submit', async e => {
+$('#drive-origin-copy').addEventListener('click', () => copyText(location.origin, '주소를 복사했어요.'));
+$('#drive-form').addEventListener('submit', async e => {
   e.preventDefault();
-  const btn = $('#sync-connect');
-  btn.disabled = true;
-  btn.textContent = '확인 중…';
-  try {
-    const cfg = await sync.connect($('#sync-repo').value, $('#sync-token').value);
-    $('#sync-token').value = '';
-    await cloud.connect(cfg);
-    toast('연결됐어요! 이제 클립이 모든 기기에 올라가요.', 3600);
-  } catch (err) {
-    toast(err.message, 5000);
-  } finally {
-    btn.disabled = false;
-    btn.textContent = '연결';
+  const id = $('#drive-client').value.trim();
+  if (!drive.looksLikeClientId(id)) {
+    toast('클라이언트 ID는 ".apps.googleusercontent.com"으로 끝나요. 다시 확인해 주세요.', 4500);
+    return;
   }
+  drive.setClientId(id);
+  cloud.renderPanel();
+  await cloud.signInAndSync();
+});
+$('#drive-login').addEventListener('click', () => cloud.signInAndSync());
+$('#drive-reset').addEventListener('click', () => {
+  drive.setClientId(null);
+  drive.disable();
+  cloud.renderPanel();
 });
 $('#sync-now').addEventListener('click', () => cloud.kick());
-$('#sync-link').addEventListener('click', async () => {
-  const link = sync.makeConnectLink(cloud.cfg);
-  const field = $('#sync-link-text');
-  try {
-    await navigator.clipboard.writeText(link);
-    toast('복사했어요. 다른 기기로 보내서 열어 주세요.');
-  } catch {
-    field.hidden = false;
-    field.value = link;
-    field.select();
-    toast('아래 링크를 길게 눌러 복사해 주세요.');
-  }
+$('#sync-link').addEventListener('click', () => {
+  const link = `${location.origin}${location.pathname}#gdrive=${encodeURIComponent(drive.clientId())}`;
+  copyText(link, '복사했어요. 다른 기기로 보내서 열어 주세요.', $('#sync-link-text'));
 });
 $('#sync-off').addEventListener('click', e => {
   const b = e.currentTarget;
@@ -414,13 +455,27 @@ $('#sync-off').addEventListener('click', e => {
   }
   delete b.dataset.confirm;
   b.textContent = '이 기기 연결 끊기';
-  cloud.cfg = null;
-  sync.setConfig(null);
+  drive.disable();
   cloud.status('');
   cloud.renderPanel();
   library.refresh();
   toast('이 기기만 연결을 끊었어요. 클립은 그대로 남아 있어요.');
 });
+
+async function copyText(text, done, fallbackField) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast(done);
+  } catch {
+    if (fallbackField) {
+      fallbackField.hidden = false;
+      fallbackField.value = text;
+      fallbackField.select();
+    }
+    toast('길게 눌러 복사해 주세요: ' + text, 5000);
+  }
+}
+
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible' && Date.now() - cloud.lastRun > 60000) cloud.kick();
 });
@@ -1355,18 +1410,17 @@ if (typeof VideoEncoder === 'undefined') {
 if ('serviceWorker' in navigator && location.protocol !== 'file:') {
   navigator.serviceWorker.register('sw.js').catch(() => {});
 }
-// A "connect another device" link: #connect=<code>
-if (location.hash.startsWith('#connect=')) {
-  const code = location.hash.slice('#connect='.length);
+// "Connect another device" link: #gdrive=<client id>
+if (location.hash.startsWith('#gdrive=')) {
+  const id = decodeURIComponent(location.hash.slice('#gdrive='.length));
   history.replaceState(null, '', '#library');
-  try {
-    const cfg = sync.parseConnectCode(code);
-    sync.connect(cfg.repo, cfg.token)
-      .then(full => cloud.connect(full))
-      .then(() => toast('이 기기도 연결됐어요! 클립을 받아 올게요.', 3600))
-      .catch(err => toast('연결하지 못했어요: ' + err.message, 5000));
-  } catch (err) {
-    toast(err.message, 4000);
+  if (drive.looksLikeClientId(id)) {
+    drive.setClientId(id);
+    setTimeout(() => {
+      $('#sync-panel').hidden = false;
+      cloud.renderPanel();
+      toast('"구글로 로그인"을 누르면 이 기기도 연결돼요.', 4000);
+    });
   }
 }
 go(location.hash.slice(1) || 'library');

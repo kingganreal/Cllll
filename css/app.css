@@ -120,6 +120,7 @@ button, input, select { font: inherit; color: inherit; }
 
 /* ---------- sync ---------- */
 .sync { display: grid; gap: 12px; padding: 16px; border-radius: var(--radius); background: var(--panel); border: 1px solid var(--line); }
+#drive-setup, #drive-signin, #drive-connected { display: grid; gap: 12px; }
 .sync-head { display: flex; justify-content: space-between; align-items: center; }
 .sync-head .section-title { margin: 0; }
 .sync p { margin: 0; max-width: 70ch; }
@@ -131,6 +132,9 @@ button, input, select { font: inherit; color: inherit; }
 .sync-form input { width: 100%; padding: 9px 12px; border-radius: 10px; border: 1px solid var(--line); background: var(--ink); }
 .sync-form .btn { margin-top: 8px; justify-self: start; }
 #sync-link-text { width: 100%; padding: 9px 12px; border-radius: 10px; border: 1px solid var(--line); background: var(--ink); font: 12px var(--mono); }
+.sync code { font: 12.5px var(--mono); background: var(--ink); border: 1px solid var(--line); border-radius: 6px; padding: 1px 6px; overflow-wrap: anywhere; }
+.origin-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 6px; }
+.sync-status button { padding: 4px 12px; font-size: 13px; }
 .ok-dot { display: inline-block; width: .55em; height: .55em; border-radius: 50%; background: #7be0a8; margin-right: .45em; vertical-align: .1em; }
 .sync-status { margin: 0; font-size: 13px; color: var(--muted); display: flex; gap: 8px; align-items: center; }
 .sync-status.busy::before { content: ""; width: 10px; height: 10px; border-radius: 50%; border: 2px solid var(--cool); border-right-color: transparent; animation: spin .8s linear infinite; }

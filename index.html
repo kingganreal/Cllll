@@ -43,36 +43,51 @@
 
       <section id="sync-panel" class="sync" hidden aria-labelledby="sync-title">
         <div class="sync-head">
-          <h2 id="sync-title" class="section-title">기기 동기화</h2>
+          <h2 id="sync-title" class="section-title">구글 드라이브 동기화</h2>
           <button id="sync-close" class="btn ghost small" type="button">닫기</button>
         </div>
 
-        <div id="sync-setup">
-          <p class="hint">폰, 패드, 컴퓨터가 같은 클립을 보도록 내 GitHub의 <b>비공개 저장소</b>에 클립을 올려 둬요. 처음 한 번만 설정하면 돼요.</p>
+        <div id="drive-setup" hidden>
+          <p class="hint">폰, 패드, 컴퓨터가 같은 클립을 보도록 내 구글 드라이브의 "직캠 스테이지" 폴더에 클립을 올려 둬요.
+            앱은 자기가 만든 파일만 볼 수 있어요. 처음 한 번, 구글에 이 앱을 등록해야 해요 (10분 정도).</p>
           <ol class="steps">
-            <li><b>비공개 저장소 만들기</b> <a href="https://github.com/new?name=fancam-clips&amp;visibility=private" target="_blank" rel="noopener">여기</a>를 열고 <b>Private</b>인지 확인한 뒤 Create repository를 누르세요.</li>
-            <li><b>토큰 만들기</b> <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">여기</a>에서 Repository access를 <b>Only select repositories → fancam-clips</b>로 고르고, Permissions의 <b>Contents</b>를 <b>Read and write</b>로 바꾼 뒤 Generate token. 나온 토큰을 복사하세요.</li>
-            <li><b>아래에 붙여 넣고 연결</b>. 다른 기기는 연결된 기기에서 만든 링크만 열면 돼요.</li>
+            <li><b>프로젝트 만들기</b> <a href="https://console.cloud.google.com/projectcreate" target="_blank" rel="noopener">구글 클라우드 콘솔</a>에서 프로젝트 이름을 <code>fancam-stage</code>로 정하고 만들기.</li>
+            <li><b>드라이브 API 켜기</b> <a href="https://console.cloud.google.com/apis/library/drive.googleapis.com" target="_blank" rel="noopener">Google Drive API</a>에서 <b>사용</b>을 누르세요.</li>
+            <li><b>앱 정보 등록</b> <a href="https://console.cloud.google.com/auth/overview" target="_blank" rel="noopener">Google 인증 플랫폼</a>에서 시작하기 → 앱 이름 <code>직캠 스테이지</code>, 지원 이메일은 내 메일, 대상은 <b>외부</b>, 연락처 이메일 입력 → 만들기.</li>
+            <li><b>나를 테스트 사용자로 추가</b> 왼쪽 메뉴 <b>대상</b> → 테스트 사용자 → Add users → 내 지메일 주소.</li>
+            <li><b>클라이언트 만들기</b> 왼쪽 메뉴 <b>클라이언트</b> → 클라이언트 만들기 → 유형 <b>웹 애플리케이션</b> →
+              <b>승인된 자바스크립트 원본</b>에 아래 주소 추가 → 만들기.
+              <span class="origin-row"><code id="drive-origin"></code> <button id="drive-origin-copy" class="btn small" type="button">복사</button></span></li>
+            <li><b>클라이언트 ID 붙여 넣기</b> 만들어진 <code>…apps.googleusercontent.com</code>로 끝나는 ID를 아래에 넣으세요.</li>
           </ol>
-          <form id="sync-form" class="sync-form">
-            <label class="label" for="sync-repo">저장소 이름</label>
-            <input id="sync-repo" type="text" value="fancam-clips" autocomplete="off" autocapitalize="off" spellcheck="false">
-            <label class="label" for="sync-token">토큰</label>
-            <input id="sync-token" type="password" placeholder="github_pat_…" autocomplete="off" autocapitalize="off" spellcheck="false">
-            <button id="sync-connect" class="btn primary" type="submit">연결</button>
+          <form id="drive-form" class="sync-form">
+            <label class="label" for="drive-client">클라이언트 ID</label>
+            <input id="drive-client" type="text" placeholder="1234…-abcd.apps.googleusercontent.com" autocomplete="off" autocapitalize="off" spellcheck="false">
+            <button class="btn primary" type="submit">저장하고 구글로 로그인</button>
           </form>
         </div>
 
-        <div id="sync-connected" hidden>
-          <p><span class="ok-dot" aria-hidden="true"></span><b id="sync-repo-name"></b>에 연결됐어요. 클립을 만들거나 지우면 다른 기기에도 똑같이 반영돼요.</p>
+        <div id="drive-signin" hidden>
+          <p class="hint">구글로 로그인하면 이 기기의 클립이 드라이브에 올라가고, 다른 기기에서 만든 클립을 받아 와요.
+            처음 로그인할 때 "Google에서 확인하지 않은 앱" 화면이 나오면 <b>계속</b>을 누르고, 드라이브 접근 체크 상자를 켜 주세요.</p>
+          <div class="row">
+            <button id="drive-login" class="btn primary" type="button">구글로 로그인</button>
+            <button id="drive-reset" class="btn ghost small" type="button">클라이언트 ID 다시 넣기</button>
+          </div>
+        </div>
+
+        <div id="drive-connected" hidden>
+          <p><span class="ok-dot" aria-hidden="true"></span>구글 드라이브의 <b>직캠 스테이지</b> 폴더와 동기화하고 있어요.
+            클립을 만들거나 이름을 바꾸거나 지우면 다른 기기에도 반영돼요.</p>
           <div class="row">
             <button id="sync-now" class="btn primary" type="button">지금 동기화</button>
             <button id="sync-link" class="btn ghost" type="button">다른 기기 연결 링크 복사</button>
             <button id="sync-off" class="btn ghost danger" type="button">이 기기 연결 끊기</button>
           </div>
           <input id="sync-link-text" type="text" readonly hidden aria-label="연결 링크">
-          <p class="hint">연결 링크에는 토큰이 들어 있어요. 카카오톡 나와의 채팅처럼 나만 보는 곳으로 보내서, 그 기기에서 열면 바로 연결돼요.
-            저장소에 클립 1개당 보통 수십 MB가 쌓여요. 지운 클립도 GitHub 기록에는 남아서 용량이 줄지는 않아요.</p>
+          <p class="hint">다른 기기에서는 이 앱을 열고 "기기 동기화" → 구글로 로그인만 하면 돼요. 클라이언트 ID를 다시 넣기 귀찮으면 연결 링크를 보내서 여세요.
+            지운 클립은 드라이브 휴지통으로 가서 30일 동안 되살릴 수 있어요.
+            구글은 보안상 한 시간쯤 지나면 로그인을 다시 확인해요. 그때는 위에 뜨는 버튼을 한 번 눌러 주세요.</p>
         </div>
       </section>
       <h2 class="section-title">내 클립 <span id="clip-count" class="count"></span></h2>
