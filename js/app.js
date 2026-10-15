@@ -13,8 +13,8 @@ const fmtTime = s => {
 };
 // SAM 2 tracking on PCs with WebGPU (each GPU is checked against the CPU once, see sam2.js).
 const SAM_ENABLED = true;
-// Finding her by face (js/face.js): stays off until it has been tested end to end.
-const FACE_ENABLED = false;
+// Finding her by face (js/face.js), with a few photos registered on the 만들기 screen.
+const FACE_ENABLED = true;
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 
 let toastTimer;
@@ -636,7 +636,10 @@ const create = {
     $('#create-error').textContent = warn.join(' ');
     // Load the models in the background so they're ready by the time she's picked.
     import('./processor.js').then(p => p.getLandmarker()).catch(err => console.warn(err));
-    import('./matting.js').then(m => m.preload()).catch(() => {});
+    // and the GPU models (SAM 2, matting, face) in their worker.
+    import('./gpu.js').then(async g => {
+      if (await g.webgpuAvailable()) g.gpuWorker().call('preload').catch(() => {});
+    });
   },
 
   leave() {
@@ -764,8 +767,6 @@ const create = {
           }
         } catch (err) { console.warn('face pick failed', err); }
       }
-      // Start fetching the SAM 2 tracker now (PC with WebGPU), so it's ready when 추출 starts.
-      if (SAM_ENABLED) import('./sam2.js').then(m => m.load()).catch(() => {});
       this.drawPick();
       $('#pick-canvas').hidden = false;
       v.hidden = true;
@@ -885,10 +886,11 @@ const create = {
       if (runId !== this.runId) return; // cancelled meanwhile
       const clip = { id: uid(), name, created: Date.now(), ...result };
       delete clip.partial;
+      delete clip.error;
       await clips.put(clip);
       requestPersistence();
       cloud.kick();
-      toast(result.partial ? `${fmtTime(result.duration)}까지 저장했어요. 무대에 올렸어요` : '완성! 무대에 올렸어요');
+      toast(result.error ? `중간에 오류가 나서 ${fmtTime(result.duration)}까지 저장했어요. 무대에 올렸어요` : result.partial ? `${fmtTime(result.duration)}까지 저장했어요. 무대에 올렸어요` : '완성! 무대에 올렸어요', result.error ? 5000 : undefined);
       this.done();
       await stage.addAndOpen(clip.id);
     } catch (err) {

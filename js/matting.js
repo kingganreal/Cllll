@@ -7,14 +7,14 @@
 // those inputs are padded with zero channels (same maths); and AveragePool ceil_mode is turned off,
 // which is equivalent because frames are always sized in multiples of 32 (see analysisSize).
 
-import { loadOrt, createSession } from './ort.js';
+import { loadOrt, createSession, gpuAdapter } from './ort.js';
 
 const MODEL = new URL('../models/rvm_mobilenetv3_webgpu.onnx', import.meta.url).href;
 
 let sessionPromise = null;
 
 export async function webgpuAvailable() {
-  try { return !!(navigator.gpu && await navigator.gpu.requestAdapter()); } catch { return false; }
+  return !!(await gpuAdapter());
 }
 
 async function session() {

@@ -9,7 +9,7 @@
 // Models: models/sam2/*.onnx — simplified (onnxsim) so onnxruntime-web accepts them, with
 // float16-stored weights that are cast back to float32 when the model loads.
 
-import { loadOrt, createSession } from './ort.js';
+import { loadOrt, createSession, gpuAdapter } from './ort.js';
 const DIR = new URL('../models/sam2/', import.meta.url).href;
 const FILES = {
   encoder: 'image_encoder.onnx', prompt: 'prompt_encoder.onnx', decoder: 'mask_decoder.onnx',
@@ -19,6 +19,11 @@ const FILES = {
 export const SIZE = 1024;           // SAM 2 input size
 const NUM_MASKMEM = 7;              // 1 conditioning (tapped) frame + 6 previous frames
 const MAX_OBJ_PTRS = 16;
+// Which previous frames to remember besides the tapped one (distance back, in SAM steps).
+// SAM 2 uses the last 6, but in onnxruntime-web's WebGPU backend memory attention slows down
+// sharply past two memories (RTX 3050 laptop: 0.27 s with 2, 0.82 s with 3, 2.1 s with 7) and was
+// most of the time spent making a clip. The face check puts the tracker back on her if it drifts.
+const RECENT = [1];
 const HW = 64 * 64;                 // tokens in the 64x64 feature map
 const C = 256, MEM = 64;
 const MEAN = [0.485, 0.456, 0.406], STD = [0.229, 0.224, 0.225];
@@ -29,7 +34,7 @@ let loadPromise = null;
 export function load(onProgress) {
   loadPromise ??= (async () => {
     const ep = globalThis.__FANCAM_SAM_EP__ || 'webgpu'; // tests can force 'wasm'
-    if (ep === 'webgpu' && (!navigator.gpu || !(await navigator.gpu.requestAdapter()))) throw new Error('WebGPU를 쓸 수 없어요.');
+    if (ep === 'webgpu' && !(await gpuAdapter())) throw new Error('WebGPU를 쓸 수 없어요.');
     const ort = await loadOrt();
     const consts = await (await fetch(DIR + 'constants.json')).json();
     const sessions = {}, buffers = {};
@@ -70,10 +75,16 @@ async function fetchWithProgress(url, onFrac) {
 // matting.js). So the first time on a given GPU, run two steps of tracking on both the GPU and
 // the CPU and only trust the GPU if they agree. The answer is remembered per GPU.
 const TRUST_KEY = 'fancam-sam2-gpu-trust';
+let trustStore = {
+  get() { try { return JSON.parse(localStorage.getItem(TRUST_KEY)) || {}; } catch { return {}; } },
+  set(v) { try { localStorage.setItem(TRUST_KEY, JSON.stringify(v)); } catch {} },
+};
+/** Where the per-GPU answer is kept (a worker has no localStorage). */
+export function setTrustStore(store) { trustStore = store; }
 
 async function gpuId() {
   try {
-    const a = await navigator.gpu.requestAdapter();
+    const a = await gpuAdapter();
     const i = a.info || (a.requestAdapterInfo ? await a.requestAdapterInfo() : {});
     return [i.vendor, i.architecture, i.device, i.description, 'ort1.30'].join('|');
   } catch { return 'unknown'; }
@@ -83,8 +94,7 @@ async function gpuId() {
 export async function gpuTrusted(models, input, points, labels, box) {
   if (models.ep !== 'webgpu') return true;
   const id = await gpuId();
-  let saved = {};
-  try { saved = JSON.parse(localStorage.getItem(TRUST_KEY)) || {}; } catch {}
+  const saved = trustStore.get();
   if (id in saved) return saved[id];
   const { ort, consts, buffers } = models;
   const cpu = {};
@@ -104,7 +114,7 @@ export async function gpuTrusted(models, input, points, labels, box) {
   }
   for (const sess of Object.values(cpu)) sess.release?.();
   saved[id] = ok;
-  try { localStorage.setItem(TRUST_KEY, JSON.stringify(saved)); } catch {}
+  trustStore.set(saved);
   if (!ok) console.warn('SAM 2 on this GPU does not match the CPU result; not using it.');
   return ok;
 }
@@ -276,11 +286,11 @@ export class Tracker {
     const f = await this.encode(input);
     this.trackPrompt ??= await this.prompt([], []);
 
-    // Spatial memories: the tapped frame, then up to 6 previous frames (oldest first).
+    // Spatial memories: the tapped frame, then previous frames (oldest first).
     const mems = [[0, this.cond]];
-    for (let tpos = 1; tpos < NUM_MASKMEM; tpos++) {
-      const prev = this.recent.get(frame - (NUM_MASKMEM - tpos));
-      if (prev) mems.push([tpos, prev]);
+    for (const d of [...(globalThis.__FANCAM_SAM_RECENT__ || RECENT)].sort((x, y) => y - x)) {
+      const prev = this.recent.get(frame - d);
+      if (prev) mems.push([NUM_MASKMEM - d, prev]);
     }
     const n1 = mems.length * HW;
     const m1 = new Float32Array(n1 * MEM), p1 = new Float32Array(n1 * MEM);

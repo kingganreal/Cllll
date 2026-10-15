@@ -5,6 +5,19 @@
 const ORT = new URL('../vendor/onnxruntime/ort.webgpu.bundle.min.mjs', import.meta.url).href;
 
 let ortPromise = null;
+let adapterPromise = null;
+
+/** The WebGPU adapter, or null. Asked once (several requestAdapter() calls at the same time in a
+ *  worker left one waiting forever), and given up on after 10 s: right after the GPU had been
+ *  reset, a worker's request never came back at all. */
+export function gpuAdapter() {
+  adapterPromise ??= (async () => {
+    const late = new Promise(resolve => setTimeout(() => resolve(null), 10000));
+    try { return (await Promise.race([navigator.gpu?.requestAdapter(), late])) || null; } catch { return null; }
+  })();
+  return adapterPromise;
+}
+
 let queue = Promise.resolve();
 
 export function loadOrt() {

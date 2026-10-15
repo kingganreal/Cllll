@@ -3,9 +3,12 @@
 // standard 112x112 crop and MobileFaceNet (ArcFace, WebFace600K) turns it into 512 numbers.
 // Two crops of the same person point the same way (cosine similarity around 0.4 and up);
 // different people come out near 0. Models: InsightFace "buffalo_s" (see models/face/NOTICE.txt).
-// Runs on the CPU (wasm): the models are small, and it only looks every half second.
+// While making a clip it runs in the GPU worker (js/gpu-worker.js) next to SAM 2 and the matting
+// model, on the GPU. On the page (registering photos, picking) it runs on the CPU: the models are
+// small, and keeping the page's onnxruntime CPU-only avoids mixing CPU and GPU sessions in one
+// runtime, which sometimes hung.
 
-import { loadOrt, createSession } from './ort.js';
+import { loadOrt, createSession, gpuAdapter } from './ort.js';
 
 const DIR = new URL('../models/face/', import.meta.url).href;
 const DET = 640;
@@ -21,13 +24,19 @@ export const OTHER = 0.25; // at most this similar (on a clear face): someone el
 // Faces this sure (against the photos alone) also teach the matcher how she looks in this video
 // (stage lights, make-up, camera): members then separate better than with the photos alone.
 const LEARN = 0.4, LEARN_MARGIN = 0.12;
+// Once it knows her look in this video, her faces score 0.43 and up (1st percentile) against it,
+// so a clear face under this is someone else.
+const OTHER_LEARNED = 0.35;
 
 let loadPromise = null;
 
 export function load() {
   loadPromise ??= (async () => {
     const ort = await loadOrt();
-    const opts = { executionProviders: ['wasm'], graphOptimizationLevel: 'all' };
+    const inWorker = typeof document === 'undefined';
+    const gpu = inWorker && await gpuAdapter();
+    const ep = globalThis.__FANCAM_FACE_EP__ || (gpu ? 'webgpu' : 'wasm'); // tests can force one
+    const opts = { executionProviders: [ep], graphOptimizationLevel: 'all' };
     const det = await createSession(DIR + 'det_500m.onnx', opts);
     const rec = await createSession(DIR + 'w600k_mbf.onnx', opts);
     return { ort, det, rec };
@@ -152,8 +161,13 @@ export function matcher(ref, seed) {
   return {
     get learned() { return seen; },
     learn,
-    /** Sets f.sim on every face; returns hers or null. */
-    findHer(found) {
+    /** A face (already scored by findHer) clearly not hers. */
+    other(f) { return f.sim < (seen >= 5 ? OTHER_LEARNED : OTHER); },
+    /**
+     * Sets f.sim on every face; returns hers or null.
+     * @param {(f) => boolean} [plausible] a last check on the best match (e.g. where it is)
+     */
+    findHer(found, plausible = () => true) {
       let best = null, second = -1;
       for (const f of found) {
         f.photoSim = similarity2(f.emb, ref);
@@ -161,7 +175,8 @@ export function matcher(ref, seed) {
         if (!best || f.sim > best.sim) { if (best) second = best.sim; best = f; }
         else if (f.sim > second) second = f.sim;
       }
-      const her = best && best.sim >= SAME && best.sim - second >= MARGIN ? best : null;
+      let her = best && best.sim >= SAME && best.sim - second >= MARGIN ? best : null;
+      if (her && !plausible(her)) her = null;
       if (her && her.photoSim >= LEARN && her.sim - second >= LEARN_MARGIN) learn(her.emb);
       return her;
     },

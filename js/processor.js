@@ -5,7 +5,7 @@
 import { PoseLandmarker } from '../vendor/mediapipe/vision_bundle.mjs';
 import { Muxer, StreamTarget } from '../vendor/mp4-muxer/mp4-muxer.mjs';
 import { openSource, seekVideo } from './source.js';
-import * as matting from './matting.js';
+import { gpuWorker, webgpuAvailable } from './gpu.js';
 import * as sam2 from './sam2.js';
 import * as face from './face.js';
 
@@ -592,9 +592,11 @@ export async function personAtFace(src, persons, fc, rw, rh) {
   const y0 = Math.max(0, Math.floor(fy0 - fh)), y1 = Math.min(H, Math.ceil(fy1 + 8 * fh));
   const cw = x1 - x0, ch = y1 - y0;
   if (cw < 16 || ch < 16) return null;
+  // MediaPipe's CPU path aborts (and stays broken) when it finds someone in a picture whose width
+  // isn't a multiple of 4, so scale the crop to one.
   const c = document.createElement('canvas');
-  c.width = cw; c.height = ch;
-  c.getContext('2d').drawImage(src, x0, y0, cw, ch, 0, 0, cw, ch);
+  c.width = Math.ceil(cw / 4) * 4; c.height = Math.ceil(ch / 4) * 4;
+  c.getContext('2d').drawImage(src, x0, y0, cw, ch, 0, 0, c.width, c.height);
   const inCrop = { ...fc, box: [fx0 - x0, fy0 - y0, fx1 - x0, fy1 - y0] };
   const p = personForFace(await detect(c), inCrop, cw, ch);
   if (!p) return null;
@@ -657,12 +659,31 @@ export async function extract(o) {
   const alphaX = layout === 'sbs' ? hw : 0, alphaY = layout === 'sbs' ? 0 : hh;
 
   o.onProgress?.({ done: 0, total: 1, elapsed: 0, eta: 0, stage: '준비 중' });
+  // The GPU models run in a worker that is shut down if the GPU hangs (see js/gpu.js); whatever
+  // fails falls back to the CPU tools below.
+  let gpu = (o.useMatting !== false || o.useSam !== false || o.faceRef) && await webgpuAvailable() ? gpuWorker() : null;
+  const configure = () => gpu.call('config', [{ samEp: globalThis.__FANCAM_SAM_EP__, recent: globalThis.__FANCAM_SAM_RECENT__ }]).catch(() => {});
+  if (gpu) {
+    configure();
+    gpu.onProgress = f => o.onProgress?.({ done: 0, total: 1, elapsed: 0, eta: 0, stage: `SAM 2 추적 모델 받는 중 ${Math.round(f * 100)}%` });
+  }
+  const off = what => err => { console.warn(what + ' off:', err); return null; };
+  // Loading deadlines: generous (creating sessions takes a while); SAM 2 also downloads ~100 MB once.
+  const LOAD = 120000, SAM_LOAD = 600000;
+  // The matting model in the worker (whichever worker is current).
+  const workerMatter = () => ({
+    run(px) { const copy = px.slice(); return gpu.call('matte', [copy], { timeout: 20000, transfer: [copy.buffer] }); },
+  });
   let [source, matter, samModels, faceModels] = await Promise.all([
     openSource(o.file, video),
-    o.useMatting === false ? null : matting.createMatter(aw, ah).catch(err => { console.warn('matting off:', err); return null; }),
-    o.useSam === false ? null : sam2.load(f => o.onProgress?.({ done: 0, total: 1, elapsed: 0, eta: 0, stage: `SAM 2 추적 모델 받는 중 ${Math.round(f * 100)}%` }))
-      .catch(err => { console.warn('SAM 2 off:', err); return null; }),
-    o.faceRef ? face.load().catch(err => { console.warn('face check off:', err); return null; }) : null,
+    gpu && o.useMatting !== false
+      ? gpu.call('mattingCreate', [aw, ah], { timeout: LOAD }).then(workerMatter).catch(off('matting'))
+      : null,
+    gpu && o.useSam !== false ? gpu.call('samLoad', [], { timeout: SAM_LOAD }).then(() => gpu).catch(off('SAM 2')) : null,
+    o.faceRef
+      ? (gpu ? gpu.call('faceLoad', [], { timeout: LOAD }).then(() => ({ gpu })) : Promise.reject(new Error('no GPU')))
+        .catch(() => face.load().then(local => ({ local }))).catch(off('face check'))
+      : null,
   ]);
   const cleanup = [() => source.close()];
   try {
@@ -735,28 +756,74 @@ export async function extract(o) {
     let lastRegion = null, badMatte = 0;
 
     // SAM 2 follows her every `samEvery` frames; the matting model draws the edges every frame.
-    let sam = samModels ? new sam2.Tracker(samModels) : null;
+    // SAM 2 runs in the GPU worker, which keeps the tracker's memory; start() begins a new one.
+    const samTracker = {
+      start: (input, ...prompt) => gpu.call('samStart', [input, ...prompt], { timeout: 30000 }),
+      next: input => gpu.call('samNext', [input], { timeout: 30000 }),
+    };
+    let sam = samModels ? samTracker : null;
     const samEvery = Math.max(1, Math.round(fps / 15));
-    const sCanvas = sam ? mk(sam2.SIZE, sam2.SIZE) : null;
+    const sCanvas = gpu ? mk(sam2.SIZE, sam2.SIZE) : null;
     const sCtx = sCanvas?.getContext('2d', { willReadFrequently: true });
-    const toRegion = sam ? makeSamRegion(aw, ah) : null;
+    const toRegion = gpu ? makeSamRegion(aw, ah) : null;
     let samRegion = null, samSeen = true, samSince = 0;
 
     // Face check: every half second, find her face among everyone's; if the tracker's mask
     // isn't on her face (or also covers someone else's), start it again on her.
-    const faceEvery = samEvery * Math.max(1, Math.round(fps * 0.5 / samEvery));
+    // (every quarter second: when she slips behind someone, the tracker can latch onto the member
+    // next to her, and this is what notices)
+    const faceEvery = samEvery * Math.max(1, Math.round(fps * 0.25 / samEvery));
     const faceMin = Math.max(r.w, r.h) * 0.012;       // smallest face worth recognising
-    let faceHidden = false, faceStrikes = 0, faceFixes = 0;
+    let faceHidden = false, faceFixes = 0;
     const herFace = o.faceRef && face.matcher(o.faceRef, o.faceSeed);
+    let faceCanvas = null;
     const lookForFaces = async f => {
       try {
-        const found = await face.faces(faceModels, ctx => f.draw(ctx, r, r.w, r.h), r.w, r.h, { minSize: faceMin });
-        return { found, her: herFace.findHer(found) };
+        let found;
+        if (faceModels.gpu && !faceModels.gpu.dead) {
+          faceCanvas ??= new OffscreenCanvas(r.w, r.h);
+          f.draw(faceCanvas.getContext('2d'), r, r.w, r.h);
+          const bmp = faceCanvas.transferToImageBitmap();
+          found = await faceModels.gpu.call('faces', [bmp, r.w, r.h, faceMin], { timeout: 20000, transfer: [bmp] });
+        } else {
+          faceModels.local ??= await face.load(); // the GPU worker was stopped: carry on on the CPU
+          found = await face.faces(faceModels.local, ctx => f.draw(ctx, r, r.w, r.h), r.w, r.h, { minSize: faceMin });
+        }
+        // A fancam keeps her near the middle. Someone at the edge needs a much surer match to count
+        // as her (another member there scored 0.51 while her half-hidden face scored 0.40).
+        const nearMiddle = fc => { const x = (fc.box[0] + fc.box[2]) / 2 / r.w; return x > 0.2 && x < 0.8; };
+        return { found, her: herFace.findHer(found, fc => nearMiddle(fc) || fc.sim >= 0.55) };
       } catch (err) {
         console.warn('face check failed:', err);
+        restartGpu(err);
         return { found: [], her: null };
       }
     };
+    // The GPU can be reset under us (a GPU fault shows as "device is lost", or the worker stops
+    // answering). Then start a fresh worker, wait for its models (twice at most) and start SAM 2
+    // again on her; if that fails, the CPU tools carry on.
+    let gpuRestarts = 0, gpuRestarting = null, samRestart = false, lastFace = null;
+    const gpuBroke = err => /OrtRun|lost|GPU가|worker/i.test(err?.message || '');
+    const restartGpu = err => {
+      if (!gpu || gpuRestarting || gpuRestarts >= 2 || !gpuBroke(err)) return;
+      gpuRestarts++;
+      console.warn('GPU models failed, restarting them:', err);
+      gpu.kill('restarting: ' + err.message);
+      gpu = gpuWorker();
+      configure();
+      matter = null;
+      gpuRestarting = Promise.all([
+        o.useMatting === false ? null : gpu.call('mattingCreate', [aw, ah], { timeout: LOAD }).then(workerMatter).catch(off('matting')),
+        o.useSam === false ? false : gpu.call('samLoad', [], { timeout: SAM_LOAD }).then(() => true, off('SAM 2')),
+        faceModels?.gpu ? gpu.call('faceLoad', [], { timeout: LOAD }).then(() => true, () => false) : false,
+      ]).then(([m, samOk, faceOk]) => {
+        matter = m;
+        samRestart = !!samOk;
+        if (faceOk) faceModels = { ...faceModels, gpu };
+        globalThis.__fancamDebug?.push({ restarted: gpuRestarts, matting: !!m, sam: !!samOk, face: !!faceOk });
+      }).finally(() => { gpuRestarting = null; });
+    };
+    if (gpu?.dead) restartGpu(new Error(gpu.dead)); // stopped while loading: try a fresh worker
     // How much of a face (eyes and nose) lies inside a mask at analysis size.
     const faceIn = (fc, m) => {
       if (!m) return 0;
@@ -794,205 +861,251 @@ export async function extract(o) {
     const prof = globalThis.__fancamProf;
     let lap = performance.now();
     const mark = name => { if (!prof) return; const now = performance.now(); prof[name] = (prof[name] || 0) + now - lap; lap = now; };
-    for await (const f of source.frames(start, end, fps, signal)) {
-      mark('decode');
-      check();
-      if (encodeError) throw encodeError;
-      const i = f.index;
-      total = f.total;
+    let failure = null;
+    try {
+      for await (const f of source.frames(start, end, fps, signal)) {
+        mark('decode');
+        check();
+        if (encodeError) throw encodeError;
+        const i = f.index;
+        total = f.total;
 
-      if (o.stop?.requested && encoded > 0) break; // 여기까지 저장
-      f.draw(aCtx, r, aw, ah);
-      const px = aCtx.getImageData(0, 0, aw, ah).data;
-      await breathe(); check();
-      mark('read');
-
-      if (sam) {
-        try {
-          if (i % samEvery === 0) {
-            f.draw(sCtx, r, sam2.SIZE, sam2.SIZE);
-            const input = sam2.toInput(sCtx.getImageData(0, 0, sam2.SIZE, sam2.SIZE).data);
-            if (i === 0) {
-              o.onProgress?.({ done: 0, total, elapsed: 0, eta: 0, stage: 'GPU 확인 중 (처음 한 번, 30초쯤)' });
-              if (!(await sam2.gpuTrusted(samModels, input, ...samPrompt(o)))) throw new Error('GPU result differs from CPU');
-            }
-            mark('sam-input');
-            const out = i === 0 ? await sam.start(input, ...samPrompt(o)) : await sam.next(input);
-            mark('sam');
-            if (i === 0 && out.score <= 0 && !faceModels) throw new Error('SAM 2 could not find her on the first frame');
-            samSeen = out.score > 0;
-            samRegion = samSeen ? toRegion(out.low, samEvery) : null;
-            samSince = 0;
-
-            if (faceModels && i % faceEvery === 0) {
-              const { found, her } = await lookForFaces(f);
-              check();
-              mark('face');
-              const mask = samRegion?.core;
-              const strangers = found.filter(fc => fc !== her && fc.sim < face.OTHER && clearFace(fc, faceMin * 2) && faceIn(fc, mask) > 0.6);
-              if (her) {
-                faceHidden = false; faceStrikes = 0;
-                // A face right next to hers (someone just behind her) can't be cut away cleanly; ignore it.
-                const apart = fc => Math.hypot((fc.box[0] + fc.box[2] - her.box[0] - her.box[2]) / 2,
-                  (fc.box[1] + fc.box[3] - her.box[1] - her.box[3]) / 2) > 1.5 * (her.box[2] - her.box[0]);
-                if (faceIn(her, mask) < 0.6 || strangers.some(apart)) {
-                  // Drifted (or spread onto someone else): start again from her face.
-                  sam = new sam2.Tracker(samModels);
-                  const again = await sam.start(input, ...(await promptFromFace(her, found)));
-                  samSeen = again.score > 0;
-                  samRegion = samSeen ? toRegion(again.low, samEvery) : null;
-                  faceFixes++;
-                }
-              } else if (strangers.length) {
-                // Someone else's face, clearly, and no sign of hers: don't show them.
-                if (++faceStrikes >= 2) faceHidden = true;
-              } else faceStrikes = 0;
-              globalThis.__fancamDebug?.push({ i, faces: found.map(fc => ({ sim: +fc.sim.toFixed(3), size: Math.round(fc.size), in: faceIn(fc, samRegion?.core), her: fc === her })), fixes: faceFixes, hidden: faceHidden });
-            }
-          } else samSince++;
-        } catch (err) {
-          if (err.name === 'AbortError') throw err;
-          console.warn('SAM 2 failed, continuing with the pose tracker:', err);
-          sam = null;
-        }
-      }
-
-      if (sam) {
-        found = samSeen && !faceHidden;
-        let pha = null;
-        if (matter) {
-          try { pha = await matter.run(px); } catch (err) { console.warn('GPU matting failed:', err); matter = null; }
-        }
-        mark('matting');
-        if (faceHidden || !samRegion) {
-          alpha.fill(0); // not her (or SAM says she isn't in view)
-        } else if (pha) {
-          const inner = samRegion.inner;
-          for (let k = 0; k < n; k++) { const v = Math.max(pha[k] * samRegion[k], inner[k]); alpha[k] = v < 0.02 ? 0 : v; }
-        } else {
-          // No matting model: snap SAM's soft mask to colour edges instead.
-          for (let k = 0, j = 0; k < n; k++, j += 4) guide[k] = (0.299 * px[j] + 0.587 * px[j + 1] + 0.114 * px[j + 2]) / 255;
-          guided(guide, samRegion.core, radius, 0.004, refined);
-          for (let k = 0; k < n; k++) { const v = (refined[k] - 0.3) / 0.4; alpha[k] = v < 0 ? 0 : v > 1 ? 1 : v; }
-        }
-      } else {
-        const persons = await detect(aCanvas);
-        await breathe(); check();
-        let person = persons.length && persons[0].w === aw ? tracker.update(persons, px) : (tracker.lost++, null);
-        if (faceModels && i % faceEvery === 0 && persons.length && persons[0].w === aw) {
-          // Her face says who she is: follow that person, and drop someone who clearly isn't her.
-          const { found, her } = await lookForFaces(f);
+        if (o.stop?.requested && encoded > 0) break; // 여기까지 저장
+        if (gpuRestarting) {
+          o.onProgress?.({ done: i, total, elapsed: 0, eta: 0, stage: 'GPU가 초기화돼서 다시 준비하는 중' });
+          await gpuRestarting;
           check();
-          const byFace = her && await personAtFace(aCanvas, persons, her, r.w, r.h);
-          if (byFace) {
-            faceHidden = false; faceStrikes = 0;
-            if (byFace !== person) {
-              person = byFace;
-              tracker.last = byFace; tracker.lost = 0; tracker.vx = tracker.vy = 0;
-              tracker.ref = colourHist(byFace, px);
-              faceFixes++;
-            }
-          } else if (person && found.some(fc => fc.sim < face.OTHER && clearFace(fc, faceMin * 2) && personForFace([person], fc, r.w, r.h))) {
-            if (++faceStrikes >= 2) faceHidden = true;
-          } else faceStrikes = 0;
-          globalThis.__fancamDebug?.push({ i, faces: found.map(fc => ({ sim: +fc.sim.toFixed(3), size: Math.round(fc.size), her: fc === her })), byFace: !!byFace, fixes: faceFixes, hidden: faceHidden });
         }
-        if (faceHidden) person = null;
-        const others = person ? persons.filter(q => q !== person && q.w === aw && q.h === ah) : [];
-        found = !!person;
-        globalThis.__fancamDebug?.push({ i, n: persons.length, lost: tracker.lost,
-          people: persons.map(q => ({ cx: +q.cx.toFixed(3), cy: +q.cy.toFixed(3), area: +q.area.toFixed(3), me: q === person,
-            lm: q.landmarks.map(l => [+l.x.toFixed(3), +l.y.toFixed(3), +(l.visibility ?? 1).toFixed(2)]) })) });
+        f.draw(aCtx, r, aw, ah);
+        const px = aCtx.getImageData(0, 0, aw, ah).data;
+        await breathe(); check();
+        mark('read');
 
-        let pha = null;
-        if (matter) {
-          try { pha = await matter.run(px); } catch (err) {
-            console.warn('GPU matting failed, continuing with the basic cut-out:', err);
-            matter = null;
+        let samStarted = false;
+        if (!sam && samRestart && i % samEvery === 0) {
+          // The GPU models are back after a restart: start tracking her again, from her face if it
+          // was seen in the last half second, else from the person the pose tracker follows.
+          samRestart = false;
+          const seen = lastFace?.her && i - lastFace.i <= fps / 2 ? lastFace : null;
+          const prompt = seen ? await promptFromFace(seen.her, seen.found).catch(() => null)
+            : tracker.last ? samPrompt({ target: tracker.last, others: [] }) : null;
+          if (prompt) {
+            try {
+              f.draw(sCtx, r, sam2.SIZE, sam2.SIZE);
+              const out = await samTracker.start(sam2.toInput(sCtx.getImageData(0, 0, sam2.SIZE, sam2.SIZE).data), ...prompt);
+              samSeen = out.score > 0;
+              samRegion = samSeen ? toRegion(out.low, samEvery) : null;
+              samSince = 0;
+              sam = samTracker;
+              samStarted = true;
+              faceHidden = false;
+            } catch (err) {
+              if (err.name === 'AbortError') throw err;
+              console.warn('SAM 2 restart failed:', err);
+              restartGpu(err);
+            }
+          } else samRestart = true; // nobody to start from yet: try again on the next SAM frame
+        }
+        if (sam && !samStarted) {
+          try {
+            if (i % samEvery === 0) {
+              f.draw(sCtx, r, sam2.SIZE, sam2.SIZE);
+              const input = sam2.toInput(sCtx.getImageData(0, 0, sam2.SIZE, sam2.SIZE).data);
+              if (i === 0) {
+                o.onProgress?.({ done: 0, total, elapsed: 0, eta: 0, stage: 'GPU 확인 중 (처음 한 번, 30초쯤)' });
+                if (!(await gpu.call('samTrusted', [input, ...samPrompt(o)], { timeout: 180000 }))) throw new Error('GPU result differs from CPU');
+              }
+              mark('sam-input');
+              const out = i === 0 ? await sam.start(input, ...samPrompt(o)) : await sam.next(input);
+              mark('sam');
+              if (i === 0 && out.score <= 0 && !faceModels) throw new Error('SAM 2 could not find her on the first frame');
+              samSeen = out.score > 0;
+              samRegion = samSeen ? toRegion(out.low, samEvery) : null;
+              samSince = 0;
+
+              if (faceModels && i % faceEvery === 0) {
+                const { found, her } = await lookForFaces(f);
+                lastFace = { i, found, her };
+                check();
+                mark('face');
+                const mask = samRegion?.core;
+                const strangers = found.filter(fc => fc !== her && herFace.other(fc) && clearFace(fc, faceMin * 2) && faceIn(fc, mask) > 0.6);
+                if (her) {
+                  faceHidden = false;
+                  // A face right next to hers (someone just behind her) can't be cut away cleanly; ignore it.
+                  const apart = fc => Math.hypot((fc.box[0] + fc.box[2] - her.box[0] - her.box[2]) / 2,
+                    (fc.box[1] + fc.box[3] - her.box[1] - her.box[3]) / 2) > 1.5 * (her.box[2] - her.box[0]);
+                  if (faceIn(her, mask) < 0.6 || strangers.some(apart)) {
+                    // Drifted (or spread onto someone else): start again from her face.
+                    sam = samTracker;
+                    const again = await sam.start(input, ...(await promptFromFace(her, found)));
+                    samSeen = again.score > 0;
+                    samRegion = samSeen ? toRegion(again.low, samEvery) : null;
+                    faceFixes++;
+                  }
+                } else if (strangers.length) {
+                  // Someone else's face, clearly, and no sign of hers: don't show them.
+                  faceHidden = true;
+                }
+                if (globalThis.__fancamDebug) {
+                  const core = samRegion?.core, box = [1, 1, 0, 0];
+                  if (core) for (let k = 0; k < n; k += 3) if (core[k] > 0.5) { const x = (k % aw) / aw, y = Math.floor(k / aw) / ah; box[0] = Math.min(box[0], x); box[1] = Math.min(box[1], y); box[2] = Math.max(box[2], x); box[3] = Math.max(box[3], y); }
+                  globalThis.__fancamDebug.push({ i, faces: found.map(fc => ({ sim: +fc.sim.toFixed(3), size: Math.round(fc.size), x: +((fc.box[0] + fc.box[2]) / 2 / r.w).toFixed(2), in: faceIn(fc, samRegion?.core), her: fc === her })), core: box.map(v => +v.toFixed(2)), fixes: faceFixes, hidden: faceHidden });
+                }
+              }
+            } else samSince++;
+          } catch (err) {
+            if (err.name === 'AbortError') throw err;
+            console.warn('SAM 2 failed, continuing with the pose tracker:', err);
+            sam = null;
+            restartGpu(err);
           }
         }
-        if (pha && person) {
-          // Safety net: if the GPU's matte keeps coming out empty where the pose model clearly sees
-          // her, the GPU isn't computing it right. Switch to the basic cut-out for the rest.
-          let sum = 0, cnt = 0;
-          for (let k = 0; k < n; k += 7) if (person.mask[k] > 0.8) { sum += pha[k]; cnt++; }
-          badMatte = cnt > 50 && sum / cnt < 0.2 ? badMatte + 1 : 0;
-          if (badMatte >= 8) { console.warn('GPU matte looks wrong, switching to the basic cut-out'); matter = null; pha = null; }
-        }
-        if (pha) {
-          // GPU matting for the edges, limited to her region.
-          let region = null;
-          if (person) region = lastRegion = buildRegion(person, others);
-          else if (lastRegion && tracker.lost <= fps) region = lastRegion; // briefly missed: keep her area
-          for (let k = 0; k < n; k++) {
-            const v = region ? pha[k] * region[k] : 0;
-            alpha[k] = v < 0.02 ? 0 : v;
+
+        if (sam) {
+          found = samSeen && !faceHidden;
+          let pha = null;
+          if (matter) {
+          try { pha = await matter.run(px); } catch (err) { console.warn('GPU matting failed:', err); matter = null; restartGpu(err); }
           }
-        } else if (person) {
-          for (let k = 0, j = 0; k < n; k++, j += 4) {
-            guide[k] = (0.299 * px[j] + 0.587 * px[j + 1] + 0.114 * px[j + 2]) / 255;
-            // Where another member overlaps her, give the pixel to whoever the model is surer of.
-            let other = 0;
-            for (const q of others) if (q.mask[k] > other) other = q.mask[k];
-            raw[k] = other > person.mask[k] ? Math.max(0, person.mask[k] - other) : person.mask[k];
-          }
-          const region = buildRegion(person, others);
-          for (let k = 0; k < n; k++) raw[k] *= region[k];
-          guided(guide, raw, radius, 0.004, refined);
-          for (let k = 0; k < n; k++) {
-            // Tighten the soft ramp: the model's masks run a little wide, which shows as a halo.
-            let v = (refined[k] - 0.32) / 0.42;
-            v = v < 0 ? 0 : v > 1 ? 1 : v;
-            alpha[k] = prevAlpha ? v * 0.85 + prevAlpha[k] * 0.15 : v; // calm frame-to-frame flicker
+          mark('matting');
+          if (faceHidden || !samRegion) {
+            alpha.fill(0); // not her (or SAM says she isn't in view)
+          } else if (pha) {
+            const inner = samRegion.inner;
+            for (let k = 0; k < n; k++) { const v = Math.max(pha[k] * samRegion[k], inner[k]); alpha[k] = v < 0.02 ? 0 : v; }
+          } else {
+            // No matting model: snap SAM's soft mask to colour edges instead.
+            for (let k = 0, j = 0; k < n; k++, j += 4) guide[k] = (0.299 * px[j] + 0.587 * px[j + 1] + 0.114 * px[j + 2]) / 255;
+            guided(guide, samRegion.core, radius, 0.004, refined);
+            for (let k = 0; k < n; k++) { const v = (refined[k] - 0.3) / 0.4; alpha[k] = v < 0 ? 0 : v > 1 ? 1 : v; }
           }
         } else {
-          // Missed her this frame: hold the last cut-out briefly, then fade, rather than show someone else.
-          const keep = tracker.lost <= Math.round(fps / 3) ? 1 : 0.6;
-          for (let k = 0; k < n; k++) alpha[k] = prevAlpha ? prevAlpha[k] * keep : 0;
-        }
-      }
+          const persons = await detect(aCanvas);
+          await breathe(); check();
+          let person = persons.length && persons[0].w === aw ? tracker.update(persons, px) : (tracker.lost++, null);
+          if (faceModels && i % faceEvery === 0 && persons.length && persons[0].w === aw) {
+            // Her face says who she is: follow that person, and drop someone who clearly isn't her.
+            const { found, her } = await lookForFaces(f);
+            lastFace = { i, found, her };
+            check();
+            const byFace = her && await personAtFace(aCanvas, persons, her, r.w, r.h);
+            if (byFace) {
+              faceHidden = false;
+              if (byFace !== person) {
+                person = byFace;
+                tracker.last = byFace; tracker.lost = 0; tracker.vx = tracker.vy = 0;
+                tracker.ref = colourHist(byFace, px);
+                faceFixes++;
+              }
+            } else if (person && found.some(fc => herFace.other(fc) && clearFace(fc, faceMin * 2) && personForFace([person], fc, r.w, r.h))) {
+              faceHidden = true;
+            }
+            globalThis.__fancamDebug?.push({ i, faces: found.map(fc => ({ sim: +fc.sim.toFixed(3), size: Math.round(fc.size), her: fc === her })), byFace: !!byFace, fixes: faceFixes, hidden: faceHidden });
+          }
+          if (faceHidden) person = null;
+          const others = person ? persons.filter(q => q !== person && q.w === aw && q.h === ah) : [];
+          found = !!person;
+          globalThis.__fancamDebug?.push({ i, n: persons.length, lost: tracker.lost,
+            people: persons.map(q => ({ cx: +q.cx.toFixed(3), cy: +q.cy.toFixed(3), area: +q.area.toFixed(3), me: q === person,
+              lm: q.landmarks.map(l => [+l.x.toFixed(3), +l.y.toFixed(3), +(l.visibility ?? 1).toFixed(2)]) })) });
 
-      // Track the overall bounding box so the player can crop empty space.
-      for (let y = 0; y < ah; y += 2) {
-        for (let x = 0; x < aw; x += 2) {
-          if (alpha[y * aw + x] > 0.5) {
-            const nx = x / aw, ny = y / ah;
-            if (nx < bounds[0]) bounds[0] = nx; if (ny < bounds[1]) bounds[1] = ny;
-            if (nx > bounds[2]) bounds[2] = nx; if (ny > bounds[3]) bounds[3] = ny;
+          let pha = null;
+          if (matter) {
+            try { pha = await matter.run(px); } catch (err) {
+              console.warn('GPU matting failed, continuing with the basic cut-out:', err);
+              matter = null;
+              restartGpu(err);
+            }
+          }
+          if (pha && person) {
+            // Safety net: if the GPU's matte keeps coming out empty where the pose model clearly sees
+            // her, the GPU isn't computing it right. Switch to the basic cut-out for the rest.
+            let sum = 0, cnt = 0;
+            for (let k = 0; k < n; k += 7) if (person.mask[k] > 0.8) { sum += pha[k]; cnt++; }
+            badMatte = cnt > 50 && sum / cnt < 0.2 ? badMatte + 1 : 0;
+            if (badMatte >= 8) { console.warn('GPU matte looks wrong, switching to the basic cut-out'); matter = null; pha = null; }
+          }
+          if (pha) {
+            // GPU matting for the edges, limited to her region.
+            let region = null;
+            if (person) region = lastRegion = buildRegion(person, others);
+            else if (lastRegion && tracker.lost <= fps) region = lastRegion; // briefly missed: keep her area
+            for (let k = 0; k < n; k++) {
+              const v = region ? pha[k] * region[k] : 0;
+              alpha[k] = v < 0.02 ? 0 : v;
+            }
+          } else if (person) {
+            for (let k = 0, j = 0; k < n; k++, j += 4) {
+              guide[k] = (0.299 * px[j] + 0.587 * px[j + 1] + 0.114 * px[j + 2]) / 255;
+              // Where another member overlaps her, give the pixel to whoever the model is surer of.
+              let other = 0;
+              for (const q of others) if (q.mask[k] > other) other = q.mask[k];
+              raw[k] = other > person.mask[k] ? Math.max(0, person.mask[k] - other) : person.mask[k];
+            }
+            const region = buildRegion(person, others);
+            for (let k = 0; k < n; k++) raw[k] *= region[k];
+            guided(guide, raw, radius, 0.004, refined);
+            for (let k = 0; k < n; k++) {
+              // Tighten the soft ramp: the model's masks run a little wide, which shows as a halo.
+              let v = (refined[k] - 0.32) / 0.42;
+              v = v < 0 ? 0 : v > 1 ? 1 : v;
+              alpha[k] = prevAlpha ? v * 0.85 + prevAlpha[k] * 0.15 : v; // calm frame-to-frame flicker
+            }
+          } else {
+            // Missed her this frame: hold the last cut-out briefly, then fade, rather than show someone else.
+            const keep = tracker.lost <= Math.round(fps / 3) ? 1 : 0.6;
+            for (let k = 0; k < n; k++) alpha[k] = prevAlpha ? prevAlpha[k] * keep : 0;
           }
         }
+
+        // Track the overall bounding box so the player can crop empty space.
+        for (let y = 0; y < ah; y += 2) {
+          for (let x = 0; x < aw; x += 2) {
+            if (alpha[y * aw + x] > 0.5) {
+              const nx = x / aw, ny = y / ah;
+              if (nx < bounds[0]) bounds[0] = nx; if (ny < bounds[1]) bounds[1] = ny;
+              if (nx > bounds[2]) bounds[2] = nx; if (ny > bounds[3]) bounds[3] = ny;
+            }
+          }
+        }
+
+        mark('alpha');
+        const md = maskImage.data;
+        for (let k = 0, j = 0; k < n; k++, j += 4) {
+          const v = alpha[k] * 255;
+          md[j] = md[j + 1] = md[j + 2] = v; md[j + 3] = 255;
+        }
+        mCtx.putImageData(maskImage, 0, 0);
+        f.draw(oCtx, r, hw, hh);
+        oCtx.drawImage(mCanvas, alphaX, alphaY, hw, hh);
+
+        mark('compose');
+        const frame = new VideoFrame(out, { timestamp: Math.round(i * 1e6 / fps), duration: Math.round(1e6 / fps) });
+        encoder.encode(frame, { keyFrame: i % fps === 0 });
+        encoded++;
+        addAudioUntil((i + 1) * 1e6 / fps);
+        frame.close();
+        while (encoder.encodeQueueSize > 3) { check(); await new Promise(res => setTimeout(res, 5)); }
+        mark('encode');
+
+        if (!thumbnail && i >= Math.min(total - 1, Math.floor(total * 0.15))) {
+          thumbnail = await makeThumbnail(out, layout, hw, hh);
+        }
+
+        [alpha, prevAlpha] = [prevAlpha ?? new Float32Array(n), alpha];
+        mark('rest');
+        const elapsed = (performance.now() - t0) / 1000;
+        o.onProgress?.({
+          done: i + 1, total, elapsed, eta: elapsed / (i + 1) * (total - i - 1),
+          preview: out, layout, found, matting: !!matter, sam: !!sam, face: !!faceModels, fixes: faceFixes, decoder: source.kind,
+        });
       }
-
-      mark('alpha');
-      const md = maskImage.data;
-      for (let k = 0, j = 0; k < n; k++, j += 4) {
-        const v = alpha[k] * 255;
-        md[j] = md[j + 1] = md[j + 2] = v; md[j + 3] = 255;
-      }
-      mCtx.putImageData(maskImage, 0, 0);
-      f.draw(oCtx, r, hw, hh);
-      oCtx.drawImage(mCanvas, alphaX, alphaY, hw, hh);
-
-      mark('compose');
-      const frame = new VideoFrame(out, { timestamp: Math.round(i * 1e6 / fps), duration: Math.round(1e6 / fps) });
-      encoder.encode(frame, { keyFrame: i % fps === 0 });
-      encoded++;
-      addAudioUntil((i + 1) * 1e6 / fps);
-      frame.close();
-      while (encoder.encodeQueueSize > 3) { check(); await new Promise(res => setTimeout(res, 5)); }
-      mark('encode');
-
-      if (!thumbnail && i >= Math.min(total - 1, Math.floor(total * 0.15))) {
-        thumbnail = await makeThumbnail(out, layout, hw, hh);
-      }
-
-      [alpha, prevAlpha] = [prevAlpha ?? new Float32Array(n), alpha];
-      mark('rest');
-      const elapsed = (performance.now() - t0) / 1000;
-      o.onProgress?.({
-        done: i + 1, total, elapsed, eta: elapsed / (i + 1) * (total - i - 1),
-        preview: out, layout, found, matting: !!matter, sam: !!sam, face: !!faceModels, fixes: faceFixes, decoder: source.kind,
-      });
+    } catch (err) {
+      // The GPU was reset, a model crashed...: keep what's made so far rather than lose it all.
+      if (err.name === 'AbortError' || !encoded) throw err;
+      console.warn('stopped early, keeping what was made:', err);
+      failure = err;
     }
     check();
     if (!encoded) throw new Error('영상에서 화면을 읽지 못했어요. 구간을 다시 정하거나 다른 영상으로 해 주세요.');
@@ -1017,6 +1130,7 @@ export async function extract(o) {
     return {
       blob, thumbnail, layout, crop, width: hw, height: hh, fps,
       duration: encoded / fps, hasAudio, codec: enc.config.codec, partial: encoded < total,
+      error: failure?.message,
     };
   } finally {
     for (const c of cleanup.reverse()) { try { c(); } catch {} }
