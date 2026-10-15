@@ -639,6 +639,7 @@ const breathe = () => (globalThis.scheduler?.yield ? scheduler.yield() : new Pro
  * @param {{requested: boolean}} [o.stop] set requested=true to finish early and keep what's done
  * @param {Float32Array} [o.faceRef]  her face (face.reference of the registered photos): checked
  *   every half second, and the tracker is put back on her if it has drifted to someone else
+ * @param {Float32Array} [o.faceSeed]  her face on the pick frame, when she was picked by face
  * @param {(p:object)=>void} o.onProgress
  * @param {AbortSignal} o.signal
  */
@@ -746,10 +747,11 @@ export async function extract(o) {
     const faceEvery = samEvery * Math.max(1, Math.round(fps * 0.5 / samEvery));
     const faceMin = Math.max(r.w, r.h) * 0.012;       // smallest face worth recognising
     let faceHidden = false, faceStrikes = 0, faceFixes = 0;
+    const herFace = o.faceRef && face.matcher(o.faceRef, o.faceSeed);
     const lookForFaces = async f => {
       try {
         const found = await face.faces(faceModels, ctx => f.draw(ctx, r, r.w, r.h), r.w, r.h, { minSize: faceMin });
-        return { found, her: face.findHer(found, o.faceRef) };
+        return { found, her: herFace.findHer(found) };
       } catch (err) {
         console.warn('face check failed:', err);
         return { found: [], her: null };
@@ -788,7 +790,12 @@ export async function extract(o) {
     let total = Math.max(1, Math.floor((end - start) * fps));
 
     let encoded = 0;
+    // Where the time goes (tests set globalThis.__fancamProf = {} to read it).
+    const prof = globalThis.__fancamProf;
+    let lap = performance.now();
+    const mark = name => { if (!prof) return; const now = performance.now(); prof[name] = (prof[name] || 0) + now - lap; lap = now; };
     for await (const f of source.frames(start, end, fps, signal)) {
+      mark('decode');
       check();
       if (encodeError) throw encodeError;
       const i = f.index;
@@ -798,6 +805,7 @@ export async function extract(o) {
       f.draw(aCtx, r, aw, ah);
       const px = aCtx.getImageData(0, 0, aw, ah).data;
       await breathe(); check();
+      mark('read');
 
       if (sam) {
         try {
@@ -808,7 +816,9 @@ export async function extract(o) {
               o.onProgress?.({ done: 0, total, elapsed: 0, eta: 0, stage: 'GPU 확인 중 (처음 한 번, 30초쯤)' });
               if (!(await sam2.gpuTrusted(samModels, input, ...samPrompt(o)))) throw new Error('GPU result differs from CPU');
             }
+            mark('sam-input');
             const out = i === 0 ? await sam.start(input, ...samPrompt(o)) : await sam.next(input);
+            mark('sam');
             if (i === 0 && out.score <= 0 && !faceModels) throw new Error('SAM 2 could not find her on the first frame');
             samSeen = out.score > 0;
             samRegion = samSeen ? toRegion(out.low, samEvery) : null;
@@ -817,6 +827,7 @@ export async function extract(o) {
             if (faceModels && i % faceEvery === 0) {
               const { found, her } = await lookForFaces(f);
               check();
+              mark('face');
               const mask = samRegion?.core;
               const strangers = found.filter(fc => fc !== her && fc.sim < face.OTHER && clearFace(fc, faceMin * 2) && faceIn(fc, mask) > 0.6);
               if (her) {
@@ -852,6 +863,7 @@ export async function extract(o) {
         if (matter) {
           try { pha = await matter.run(px); } catch (err) { console.warn('GPU matting failed:', err); matter = null; }
         }
+        mark('matting');
         if (faceHidden || !samRegion) {
           alpha.fill(0); // not her (or SAM says she isn't in view)
         } else if (pha) {
@@ -951,6 +963,7 @@ export async function extract(o) {
         }
       }
 
+      mark('alpha');
       const md = maskImage.data;
       for (let k = 0, j = 0; k < n; k++, j += 4) {
         const v = alpha[k] * 255;
@@ -960,18 +973,21 @@ export async function extract(o) {
       f.draw(oCtx, r, hw, hh);
       oCtx.drawImage(mCanvas, alphaX, alphaY, hw, hh);
 
+      mark('compose');
       const frame = new VideoFrame(out, { timestamp: Math.round(i * 1e6 / fps), duration: Math.round(1e6 / fps) });
       encoder.encode(frame, { keyFrame: i % fps === 0 });
       encoded++;
       addAudioUntil((i + 1) * 1e6 / fps);
       frame.close();
       while (encoder.encodeQueueSize > 3) { check(); await new Promise(res => setTimeout(res, 5)); }
+      mark('encode');
 
       if (!thumbnail && i >= Math.min(total - 1, Math.floor(total * 0.15))) {
         thumbnail = await makeThumbnail(out, layout, hw, hh);
       }
 
       [alpha, prevAlpha] = [prevAlpha ?? new Float32Array(n), alpha];
+      mark('rest');
       const elapsed = (performance.now() - t0) / 1000;
       o.onProgress?.({
         done: i + 1, total, elapsed, eta: elapsed / (i + 1) * (total - i - 1),

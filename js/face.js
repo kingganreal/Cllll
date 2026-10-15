@@ -5,27 +5,31 @@
 // different people come out near 0. Models: InsightFace "buffalo_s" (see models/face/NOTICE.txt).
 // Runs on the CPU (wasm): the models are small, and it only looks every half second.
 
-const ORT = new URL('../vendor/onnxruntime/ort.webgpu.bundle.min.mjs', import.meta.url).href;
+import { loadOrt, createSession } from './ort.js';
+
 const DIR = new URL('../models/face/', import.meta.url).href;
 const DET = 640;
 // Where the eyes, nose and mouth corners sit in the 112x112 crop the recogniser was trained on.
 const TEMPLATE = [[38.2946, 51.6963], [73.5318, 51.5014], [56.0252, 71.7366], [41.5493, 92.3655], [70.7299, 92.2041]];
 
-export const SAME = 0.3;   // at least this similar: her
-export const OTHER = 0.15; // at most this similar (on a clear face): someone else
+// Measured on a group fancam where every member wears the same white outfit: her faces scored
+// 0.37-0.75 against her photos, the other members mostly 0.0-0.42 (up to 0.51). So "her" needs a
+// clear score and a lead over the next face, and "someone else" only a low one.
+export const SAME = 0.42;  // at least this similar, and MARGIN ahead of the next face: her
+export const MARGIN = 0.08;
+export const OTHER = 0.25; // at most this similar (on a clear face): someone else
+// Faces this sure (against the photos alone) also teach the matcher how she looks in this video
+// (stage lights, make-up, camera): members then separate better than with the photos alone.
+const LEARN = 0.4, LEARN_MARGIN = 0.12;
 
 let loadPromise = null;
 
 export function load() {
   loadPromise ??= (async () => {
-    const ort = await import(ORT);
-    ort.env.wasm.wasmPaths = new URL('../vendor/onnxruntime/', import.meta.url).href;
-    ort.env.wasm.numThreads = 1;
+    const ort = await loadOrt();
     const opts = { executionProviders: ['wasm'], graphOptimizationLevel: 'all' };
-    const [det, rec] = await Promise.all([
-      ort.InferenceSession.create(DIR + 'det_500m.onnx', opts),
-      ort.InferenceSession.create(DIR + 'w600k_mbf.onnx', opts),
-    ]);
+    const det = await createSession(DIR + 'det_500m.onnx', opts);
+    const rec = await createSession(DIR + 'w600k_mbf.onnx', opts);
     return { ort, det, rec };
   })().catch(err => { loadPromise = null; throw err; });
   return loadPromise;
@@ -127,13 +131,41 @@ export function similarity2(a, b) {
 
 /** Which face (if any) is her: the best match, clearly ahead of the next one. */
 export function findHer(found, ref) {
-  let best = null, second = -1;
-  for (const f of found) {
-    f.sim = similarity2(f.emb, ref);
-    if (!best || f.sim > best.sim) { if (best) second = best.sim; best = f; }
-    else if (f.sim > second) second = f.sim;
-  }
-  return best && best.sim >= SAME && best.sim - second >= 0.06 ? best : null;
+  return matcher(ref).findHer(found);
+}
+
+/**
+ * Recognises her through one video. Scores each face against her photos and, once it has seen
+ * her for sure a couple of times, against how she looks in this video too (whichever is higher).
+ * @param {Float32Array} ref  her photos (reference())
+ * @param {Float32Array} [seed]  a face known to be hers in this video (e.g. the one picked)
+ */
+export function matcher(ref, seed) {
+  const sum = new Float32Array(512);
+  let seen = 0, video = null;
+  const learn = emb => {
+    for (let k = 0; k < 512; k++) sum[k] += emb[k];
+    seen++;
+    video = normalise(sum);
+  };
+  if (seed) learn(seed);
+  return {
+    get learned() { return seen; },
+    learn,
+    /** Sets f.sim on every face; returns hers or null. */
+    findHer(found) {
+      let best = null, second = -1;
+      for (const f of found) {
+        f.photoSim = similarity2(f.emb, ref);
+        f.sim = seen >= 2 ? Math.max(f.photoSim, similarity2(f.emb, video)) : f.photoSim;
+        if (!best || f.sim > best.sim) { if (best) second = best.sim; best = f; }
+        else if (f.sim > second) second = f.sim;
+      }
+      const her = best && best.sim >= SAME && best.sim - second >= MARGIN ? best : null;
+      if (her && her.photoSim >= LEARN && her.sim - second >= LEARN_MARGIN) learn(her.emb);
+      return her;
+    },
+  };
 }
 
 function normalise(v) {

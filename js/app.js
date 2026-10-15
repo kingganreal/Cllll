@@ -743,6 +743,7 @@ const create = {
       this.pickApi = p;
       // With her face registered, pick her by face.
       this.faceFound = null;
+      this.faceSeed = null;
       const ref = await faces.reference();
       if (ref) {
         btn.textContent = '얼굴 찾는 중…';
@@ -754,9 +755,11 @@ const create = {
           const her = f.findHer(found, ref);
           const who = her && await p.personAtFace(c, this.persons, her, r.w, r.h);
           this.faceFound = !!who;
+          globalThis.__fancamDebug?.push({ pick: found.map(fc => ({ sim: +fc.sim.toFixed(3), size: Math.round(fc.size), box: fc.box.map(Math.round) })), her: !!her, who: !!who });
           if (who) {
             if (!this.persons.includes(who)) this.persons.push(who);
             this.target = who;
+            this.faceSeed = her.emb;
             this.tap = [(her.box[0] + her.box[2]) / 2 / r.w, (her.box[1] + her.box[3]) / 2 / r.h];
           }
         } catch (err) { console.warn('face pick failed', err); }
@@ -842,7 +845,7 @@ const create = {
     const opts = {
       file: this.file, video: v, start: this.start, end: this.end, target: this.target, rect: this.rect(),
       tap: this.tap, others: this.persons, stop: (this.stopFlag = { requested: false }),
-      useSam: SAM_ENABLED, faceRef: await faces.reference(),
+      useSam: SAM_ENABLED, faceRef: await faces.reference(), faceSeed: this.tapped ? null : this.faceSeed,
       fps: Number($('#fps').value), maxSide: Number($('#quality').value),
       withAudio: $('#with-audio').checked,
     };

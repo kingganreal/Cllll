@@ -7,7 +7,8 @@
 // those inputs are padded with zero channels (same maths); and AveragePool ceil_mode is turned off,
 // which is equivalent because frames are always sized in multiples of 32 (see analysisSize).
 
-const ORT = new URL('../vendor/onnxruntime/ort.webgpu.bundle.min.mjs', import.meta.url).href;
+import { loadOrt, createSession } from './ort.js';
+
 const MODEL = new URL('../models/rvm_mobilenetv3_webgpu.onnx', import.meta.url).href;
 
 let sessionPromise = null;
@@ -19,10 +20,14 @@ export async function webgpuAvailable() {
 async function session() {
   sessionPromise ??= (async () => {
     if (!(await webgpuAvailable())) throw new Error('이 기기에서는 WebGPU를 쓸 수 없어요.');
-    const ort = await import(ORT);
-    ort.env.wasm.wasmPaths = new URL('../vendor/onnxruntime/', import.meta.url).href;
-    ort.env.wasm.numThreads = 1;
-    const s = await ort.InferenceSession.create(MODEL, { executionProviders: ['webgpu'], graphOptimizationLevel: 'all' });
+    const ort = await loadOrt();
+    // The recurrent state only goes back into the next frame and the colour output isn't used,
+    // so keep them on the GPU instead of copying them to the CPU (and back) every frame.
+    const gpu = 'gpu-buffer';
+    const s = await createSession(MODEL, {
+      executionProviders: ['webgpu'], graphOptimizationLevel: 'all',
+      preferredOutputLocation: { fgr: gpu, r1o: gpu, r2o: gpu, r3o: gpu, r4o: gpu },
+    });
     return { ort, s };
   })().catch(err => { sessionPromise = null; throw err; });
   return sessionPromise;

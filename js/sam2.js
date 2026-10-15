@@ -9,7 +9,7 @@
 // Models: models/sam2/*.onnx — simplified (onnxsim) so onnxruntime-web accepts them, with
 // float16-stored weights that are cast back to float32 when the model loads.
 
-const ORT = new URL('../vendor/onnxruntime/ort.webgpu.bundle.min.mjs', import.meta.url).href;
+import { loadOrt, createSession } from './ort.js';
 const DIR = new URL('../models/sam2/', import.meta.url).href;
 const FILES = {
   encoder: 'image_encoder.onnx', prompt: 'prompt_encoder.onnx', decoder: 'mask_decoder.onnx',
@@ -30,16 +30,16 @@ export function load(onProgress) {
   loadPromise ??= (async () => {
     const ep = globalThis.__FANCAM_SAM_EP__ || 'webgpu'; // tests can force 'wasm'
     if (ep === 'webgpu' && (!navigator.gpu || !(await navigator.gpu.requestAdapter()))) throw new Error('WebGPU를 쓸 수 없어요.');
-    const ort = await import(ORT);
-    ort.env.wasm.wasmPaths = new URL('../vendor/onnxruntime/', import.meta.url).href;
-    ort.env.wasm.numThreads = 1;
+    const ort = await loadOrt();
     const consts = await (await fetch(DIR + 'constants.json')).json();
     const sessions = {}, buffers = {};
     const names = Object.keys(FILES);
     let done = 0;
     for (const k of names) {
       buffers[k] = await fetchWithProgress(DIR + FILES[k], f => onProgress?.((done + f) / names.length));
-      sessions[k] = await ort.InferenceSession.create(buffers[k], { executionProviders: [ep], graphOptimizationLevel: 'all' });
+      // The encoder's two high-resolution feature maps only feed the mask decoder: keep them on the GPU.
+      const keep = ep === 'webgpu' && k === 'encoder' ? { preferredOutputLocation: { backbone_fpn_0: 'gpu-buffer', backbone_fpn_1: 'gpu-buffer' } } : {};
+      sessions[k] = await createSession(buffers[k], { executionProviders: [ep], graphOptimizationLevel: 'all', ...keep });
       done++;
       onProgress?.(done / names.length);
     }
@@ -88,7 +88,7 @@ export async function gpuTrusted(models, input, points, labels, box) {
   if (id in saved) return saved[id];
   const { ort, consts, buffers } = models;
   const cpu = {};
-  for (const k of Object.keys(buffers)) cpu[k] = await ort.InferenceSession.create(buffers[k], { executionProviders: ['wasm'] });
+  for (const k of Object.keys(buffers)) cpu[k] = await createSession(buffers[k], { executionProviders: ['wasm'] });
   const run = async sessions => {
     const t = new Tracker({ ort, sessions, consts });
     const a = await t.start(input, points, labels, box);
@@ -120,6 +120,11 @@ function toTokens(src, c) {
   }
   return out;
 }
+// Frees feature maps kept on the GPU once the frame is done.
+function release(f) {
+  for (const t of [f.fpn0, f.fpn1]) if (t.location === 'gpu-buffer') t.dispose();
+}
+
 // (4096, 1, c) tokens -> (1, c, 64, 64)
 function fromTokens(src, c) {
   const out = new Float32Array(HW * c);
@@ -258,6 +263,7 @@ export class Tracker {
     for (let ch = 0; ch < C; ch++) { const b = ch * HW; for (let p = 0; p < HW; p++) pix[b + p] += nm[ch]; }
     const out = await this.heads(pix, f, await this.prompt(points, labels), points.length <= 1);
     const mem = await this.memorise(f, out.low, true);
+    release(f);
     this.frame = 0;
     this.cond = { ...mem, ptr: out.ptr, frame: 0 };
     this.recent.clear();
@@ -316,6 +322,7 @@ export class Tracker {
     const pix = fromTokens(await data(o.pix_feat), C);
     const out = await this.heads(pix, f, this.trackPrompt, true);
     const mem = await this.memorise(f, out.low, false);
+    release(f);
     this.recent.set(frame, { ...mem, ptr: out.ptr });
     for (const k of this.recent.keys()) if (k < frame - MAX_OBJ_PTRS) this.recent.delete(k);
     return out;
