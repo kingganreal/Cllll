@@ -1177,19 +1177,44 @@ const stage = {
     return sp;
   },
 
-  async addAndOpen(clipId) {
+  // From the library (or right after making a clip): the stage shows just that clip.
+  // From the stage's "클립 올리기": it joins the others, and they're lined up side by side.
+  async addAndOpen(clipId, { alongside = false } = {}) {
     await this.load();
-    const n = this.state.sprites.length;
-    this.state.sprites.push({ clipId, x: 0.5 + ((n % 3) - 1) * 0.22 * Math.min(1, n), y: 0.55, h: 0.85, flip: false, speed: 1 });
-    this.save();
+    const s = { clipId, x: 0.5, y: 0.55, h: 0.85, flip: false, speed: 1 };
+    if (!alongside) {
+      this.state.sprites = [s];
+      this.save();
+      if (current === 'stage') await this.mount(); else go('stage');
+      return;
+    }
+    this.state.sprites.push(s);
     if (current === 'stage') {
       const data = await clips.get(clipId);
-      const sp = this.spawn(this.state.sprites.at(-1), data);
+      const sp = this.spawn(s, data);
       $('#stage-empty').hidden = true;
+      this.arrange();
       this.select(sp);
     } else {
+      this.arrange();
       go('stage');
     }
+  },
+
+  // Equal slots across the stage, each clip as tall as fits its slot without overlapping.
+  arrange() {
+    const st = $('#stage').getBoundingClientRect();
+    const list = this.state.sprites, k = list.length;
+    if (!k || !st.width) { this.save(); return; }
+    const aspectOf = s => this.sprites.find(sp => sp.s === s)?.clip.aspect || 0.5625;
+    list.forEach((s, i) => {
+      const slot = st.width / k;
+      s.x = (i + 0.5) / k;
+      s.h = Math.min(0.85, (slot * 0.96) / (aspectOf(s) * st.height));
+      s.y = 0.95 - s.h / 2;
+    });
+    this.layoutAll();
+    this.save();
   },
 
   forget(clipId) {
@@ -1326,7 +1351,7 @@ const stage = {
         const span = document.createElement('span');
         span.textContent = c.name;
         b.append(img, span);
-        b.onclick = () => { this.closeSheet(); this.addAndOpen(c.id); };
+        b.onclick = () => { this.closeSheet(); this.addAndOpen(c.id, { alongside: true }); };
         wrap.append(b);
       }
     }
@@ -1438,6 +1463,7 @@ views.stage.addEventListener('click', e => {
   ({
     add: () => stage.showAddSheet(),
     bg: () => stage.showBgSheet(),
+    arrange: () => stage.arrange(),
     play: () => stage.togglePlay(),
     fullscreen: () => stage.fullscreen(),
     pip: () => stage.pip(),
