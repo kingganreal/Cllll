@@ -35,10 +35,11 @@ export async function createMatter(width, height) {
   const { ort, s } = await session();
   const zero = () => new ort.Tensor('float32', new Float32Array(1), [1, 1, 1, 1]);
   let rec = [zero(), zero(), zero(), zero()];
-  // RVM works internally at half size (sizes are multiples of 32, so every stage divides evenly)
-  // and refines edges at full input size.
+  // RVM's main network runs at `ratio` of the input and refines edges at full size. Below ~480px
+  // it starts losing thin limbs (an outstretched arm), so only halve big inputs. Sizes are
+  // multiples of 32, so every stage divides evenly either way.
   if (width % 32 || height % 32) throw new Error('matting needs sizes in multiples of 32');
-  const ratio = new ort.Tensor('float32', new Float32Array([0.5]), [1]);
+  const ratio = new ort.Tensor('float32', new Float32Array([Math.max(width, height) > 800 ? 0.5 : 1]), [1]);
   const n = width * height;
   const input = new Float32Array(3 * n);
 
