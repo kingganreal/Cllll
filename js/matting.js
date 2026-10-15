@@ -1,10 +1,14 @@
 // Robust Video Matting (RVM, MobileNetV3) on the GPU through onnxruntime-web's WebGPU backend.
 // It gives clean, temporally steady edges (hair, fingers, skirts) for every person in the frame;
 // processor.js multiplies it by the chosen member's region, so other members still drop out.
-// Model: https://github.com/PeterL1n/RobustVideoMatting (GPL-3.0, see models/RVM-LICENSE.txt).
+// Model: https://github.com/PeterL1n/RobustVideoMatting (GPL-3.0, see models/RVM-LICENSE.txt),
+// modified for WebGPU: onnxruntime's WebGPU convolution gives wrong results when a 3x3 conv has an
+// input-channel count that isn't a multiple of 4 (decoder convs with 171/107/59/35 channels), so
+// those inputs are padded with zero channels (same maths); and AveragePool ceil_mode is turned off,
+// which is equivalent because frames are always sized in multiples of 32 (see analysisSize).
 
 const ORT = new URL('../vendor/onnxruntime/ort.webgpu.bundle.min.mjs', import.meta.url).href;
-const MODEL = new URL('../models/rvm_mobilenetv3_fp32.onnx', import.meta.url).href;
+const MODEL = new URL('../models/rvm_mobilenetv3_webgpu.onnx', import.meta.url).href;
 
 let sessionPromise = null;
 
@@ -31,8 +35,10 @@ export async function createMatter(width, height) {
   const { ort, s } = await session();
   const zero = () => new ort.Tensor('float32', new Float32Array(1), [1, 1, 1, 1]);
   let rec = [zero(), zero(), zero(), zero()];
-  // RVM works internally at ~384px on the long side and refines edges at full input size.
-  const ratio = new ort.Tensor('float32', new Float32Array([Math.min(1, 384 / Math.max(width, height))]), [1]);
+  // RVM works internally at half size (sizes are multiples of 32, so every stage divides evenly)
+  // and refines edges at full input size.
+  if (width % 32 || height % 32) throw new Error('matting needs sizes in multiples of 32');
+  const ratio = new ort.Tensor('float32', new Float32Array([0.5]), [1]);
   const n = width * height;
   const input = new Float32Array(3 * n);
 

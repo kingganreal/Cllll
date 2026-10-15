@@ -362,8 +362,13 @@ export function fullRect(video) {
   return { x: 0, y: 0, w: video.videoWidth, h: video.videoHeight };
 }
 
+// Multiples of 32 so the matting model's stages divide evenly (the slight stretch is undone
+// when the matte is scaled back onto the frame).
 export function analysisSize(rect, maxSide) {
-  return fitSize(rect.w, rect.h, analysisSide(maxSide));
+  const side = analysisSide(maxSide);
+  const s = Math.min(1, side / Math.max(rect.w, rect.h));
+  const to32 = v => Math.max(64, Math.round(v * s / 32) * 32);
+  return [to32(rect.w), to32(rect.h)];
 }
 
 // Finds black bars (letterboxing, screen-recording borders) by sampling a few frames.
@@ -578,13 +583,14 @@ export async function extract(o) {
     const buildRegion = makeRegionBuilder(aw, ah);
     const radius = Math.max(2, Math.round(Math.max(aw, ah) / 110));
     const tracker = new Tracker(o.target, fps);
-    let lastRegion = null;
+    let lastRegion = null, badMatte = 0;
 
     const bounds = [1, 1, 0, 0];
     let thumbnail = null, found = true;
     const t0 = performance.now();
     let total = Math.max(1, Math.floor((end - start) * fps));
 
+    let encoded = 0;
     for await (const f of source.frames(start, end, fps, signal)) {
       check();
       if (encodeError) throw encodeError;
@@ -609,6 +615,14 @@ export async function extract(o) {
           console.warn('GPU matting failed, continuing with the basic cut-out:', err);
           matter = null;
         }
+      }
+      if (pha && person) {
+        // Safety net: if the GPU's matte keeps coming out empty where the pose model clearly sees
+        // her, the GPU isn't computing it right. Switch to the basic cut-out for the rest.
+        let sum = 0, cnt = 0;
+        for (let k = 0; k < n; k += 7) if (person.mask[k] > 0.8) { sum += pha[k]; cnt++; }
+        badMatte = cnt > 50 && sum / cnt < 0.2 ? badMatte + 1 : 0;
+        if (badMatte >= 8) { console.warn('GPU matte looks wrong, switching to the basic cut-out'); matter = null; pha = null; }
       }
       if (pha) {
         // GPU matting for the edges, limited to her region.
@@ -664,6 +678,7 @@ export async function extract(o) {
 
       const frame = new VideoFrame(out, { timestamp: Math.round(i * 1e6 / fps), duration: Math.round(1e6 / fps) });
       encoder.encode(frame, { keyFrame: i % fps === 0 });
+      encoded++;
       frame.close();
       while (encoder.encodeQueueSize > 3) { check(); await new Promise(res => setTimeout(res, 5)); }
 
@@ -679,6 +694,7 @@ export async function extract(o) {
       });
     }
     check();
+    if (!encoded) throw new Error('영상에서 화면을 읽지 못했어요. 구간을 다시 정하거나 다른 영상으로 해 주세요.');
 
     await encoder.flush();
     encoder.close();

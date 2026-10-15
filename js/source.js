@@ -89,7 +89,9 @@ class DecoderSource {
     });
     decoder.configure(this.config);
     decoder.addEventListener?.('dequeue', notify);
-    const reader = this.demuxer.read('video', Math.max(0, start), end + 1).getReader();
+    // No end bound: the loop below stops once it has every output frame. (A track can start later
+    // than the file's timeline; the <video> element shows its first frame until then, and so do we.)
+    const reader = this.demuxer.read('video', Math.max(0, start)).getReader();
 
     // Next decoded frame, feeding the decoder only as fast as we use frames (decoders stall
     // when too many frames are held).

@@ -136,7 +136,8 @@ desktop/            윈도우 앱 (Electron: 바탕화면 오버레이, 유튜�
 js/app.js           UI, 무대 조작
 sw.js               오프라인 캐시
 vendor/, models/    MediaPipe tasks-vision 1.0.1, mp4-muxer 5.2.2, web-demuxer 4.0.0, onnxruntime-web 1.30.0,
-                    pose_landmarker_full, RVM mobilenetv3 (GPL-3.0, models/RVM-LICENSE.txt)
+                    pose_landmarker_full, RVM mobilenetv3 (GPL-3.0, models/RVM-LICENSE.txt;
+                    WebGPU에서 정확히 돌도록 일부 합성곱 입력을 0 채널로 채우고 AveragePool ceil_mode를 끈 수정본)
 ```
 
 투명 영상을 모든 기기에서 재생하려고, 결과물은 한 프레임에 **색(왼쪽)과 투명도(오른쪽)**를 나란히 담은
