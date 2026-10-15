@@ -34,16 +34,16 @@ export function load(onProgress) {
     ort.env.wasm.wasmPaths = new URL('../vendor/onnxruntime/', import.meta.url).href;
     ort.env.wasm.numThreads = 1;
     const consts = await (await fetch(DIR + 'constants.json')).json();
-    const sessions = {};
+    const sessions = {}, buffers = {};
     const names = Object.keys(FILES);
     let done = 0;
     for (const k of names) {
-      const buf = await fetchWithProgress(DIR + FILES[k], f => onProgress?.((done + f) / names.length));
-      sessions[k] = await ort.InferenceSession.create(buf, { executionProviders: [ep], graphOptimizationLevel: 'all' });
+      buffers[k] = await fetchWithProgress(DIR + FILES[k], f => onProgress?.((done + f) / names.length));
+      sessions[k] = await ort.InferenceSession.create(buffers[k], { executionProviders: [ep], graphOptimizationLevel: 'all' });
       done++;
       onProgress?.(done / names.length);
     }
-    return { ort, sessions, consts };
+    return { ort, sessions, consts, buffers, ep };
   })().catch(err => { loadPromise = null; throw err; });
   return loadPromise;
 }
@@ -64,6 +64,49 @@ async function fetchWithProgress(url, onFrac) {
     onFrac(got / total);
   }
   return out;
+}
+
+// GPUs differ, and onnxruntime's WebGPU kernels have been wrong before on some shapes (see
+// matting.js). So the first time on a given GPU, run two steps of tracking on both the GPU and
+// the CPU and only trust the GPU if they agree. The answer is remembered per GPU.
+const TRUST_KEY = 'fancam-sam2-gpu-trust';
+
+async function gpuId() {
+  try {
+    const a = await navigator.gpu.requestAdapter();
+    const i = a.info || (a.requestAdapterInfo ? await a.requestAdapterInfo() : {});
+    return [i.vendor, i.architecture, i.device, i.description, 'ort1.30'].join('|');
+  } catch { return 'unknown'; }
+}
+
+/** True when the GPU computes SAM 2 like the CPU does. `input` is one frame from toInput(). */
+export async function gpuTrusted(models, input, points, labels, box) {
+  if (models.ep !== 'webgpu') return true;
+  const id = await gpuId();
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem(TRUST_KEY)) || {}; } catch {}
+  if (id in saved) return saved[id];
+  const { ort, consts, buffers } = models;
+  const cpu = {};
+  for (const k of Object.keys(buffers)) cpu[k] = await ort.InferenceSession.create(buffers[k], { executionProviders: ['wasm'] });
+  const run = async sessions => {
+    const t = new Tracker({ ort, sessions, consts });
+    const a = await t.start(input, points, labels, box);
+    const b = await t.next(input); // same picture again: exercises the memory path
+    return [a.low, b.low];
+  };
+  const [g, c] = [await run(models.sessions), await run(cpu)];
+  let ok = true;
+  for (let f = 0; f < 2; f++) {
+    let agree = 0, pos = 0;
+    for (let k = 0; k < 65536; k++) { if ((g[f][k] > 0) === (c[f][k] > 0)) agree++; if (c[f][k] > 0) pos++; }
+    if (agree / 65536 < 0.98 || pos < 20) ok = false;
+  }
+  for (const sess of Object.values(cpu)) sess.release?.();
+  saved[id] = ok;
+  try { localStorage.setItem(TRUST_KEY, JSON.stringify(saved)); } catch {}
+  if (!ok) console.warn('SAM 2 on this GPU does not match the CPU result; not using it.');
+  return ok;
 }
 
 const data = async t => (t.location && t.location !== 'cpu' ? await t.getData() : t.data);

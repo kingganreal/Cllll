@@ -673,6 +673,10 @@ export async function extract(o) {
           if (i % samEvery === 0) {
             f.draw(sCtx, r, sam2.SIZE, sam2.SIZE);
             const input = sam2.toInput(sCtx.getImageData(0, 0, sam2.SIZE, sam2.SIZE).data);
+            if (i === 0) {
+              o.onProgress?.({ done: 0, total, elapsed: 0, eta: 0, stage: 'GPU 확인 중 (처음 한 번, 30초쯤)' });
+              if (!(await sam2.gpuTrusted(samModels, input, ...samPrompt(o)))) throw new Error('GPU result differs from CPU');
+            }
             const out = i === 0 ? await sam.start(input, ...samPrompt(o)) : await sam.next(input);
             if (i === 0 && out.score <= 0) throw new Error('SAM 2 could not find her on the first frame');
             samSeen = out.score > 0;
