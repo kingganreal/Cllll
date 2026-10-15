@@ -625,7 +625,23 @@ const create = {
     }
   },
 
+  // A start scene where she overlaps someone makes it harder to tell them apart later.
+  pickHint() {
+    const t = this.target, hint = $('#pick-hint');
+    const overlap = t?.bbox && this.persons.some(p => {
+      if (p === t || !p.bbox) return false;
+      const ix = Math.max(0, Math.min(t.bbox[2], p.bbox[2]) - Math.max(t.bbox[0], p.bbox[0]));
+      const iy = Math.max(0, Math.min(t.bbox[3], p.bbox[3]) - Math.max(t.bbox[1], p.bbox[1]));
+      return ix * iy > (t.bbox[2] - t.bbox[0]) * (t.bbox[3] - t.bbox[1]) * 0.08;
+    });
+    hint.textContent = overlap
+      ? '고른 멤버가 다른 멤버와 겹쳐 있어요. 혼자 잘 보이는 장면을 시작 지점으로 고르면 더 정확해요.'
+      : '따낼 멤버를 탭하세요. 분홍색으로 표시된 사람만 남아요.';
+    hint.classList.toggle('warn', !!overlap);
+  },
+
   drawPick() {
+    this.pickHint();
     const v = $('#src-video');
     const c = $('#pick-canvas');
     const rect = this.rect();

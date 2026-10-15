@@ -117,6 +117,7 @@ button, input, select { font: inherit; color: inherit; }
 .notice { margin: 0; padding: 12px 14px; border-radius: 10px; border: 1px solid color-mix(in srgb, var(--cool) 40%, var(--line)); color: var(--cool); }
 .error { margin: 0; color: var(--danger); }
 .hint { margin: 0; font-size: 13px; color: var(--muted); }
+.hint.warn { color: #ffcf7a; }
 
 /* ---------- sync ---------- */
 .sync { display: grid; gap: 12px; padding: 16px; border-radius: var(--radius); background: var(--panel); border: 1px solid var(--line); }

@@ -486,22 +486,39 @@ async function encodeAudio(audio, out) {
 // ---------------------------------------------------------------------------
 // SAM 2 helpers
 
-// The first frame's prompt: where she was tapped (or her middle), a box around her whole body,
-// and "not her" points on the other people found next to her.
+// The first frame's prompt. Points on her own joints (head, chest, hips, knees) say "this whole
+// person"; a box around her helps too, but only when nobody else overlaps it (otherwise the box
+// would cover them as well). Other people found next to her get "not her" points.
 function samPrompt(o) {
   const S = sam2.SIZE, t = o.target;
   const pts = [], labels = [];
-  const [tx, ty] = o.tap ?? [t.cx, t.cy];
-  pts.push([tx * S, ty * S]); labels.push(1);
+  const add = (x, y, label) => { if (x > 0 && x < 1 && y > 0 && y < 1) { pts.push([x * S, y * S]); labels.push(label); } };
+  if (o.tap) add(o.tap[0], o.tap[1], 1);
+  const lm = t.landmarks || [];
+  const vis = i => lm[i] && (lm[i].visibility ?? 1) > 0.5;
+  const mid = (a, b) => [(lm[a].x + lm[b].x) / 2, (lm[a].y + lm[b].y) / 2];
+  if (vis(0)) add(lm[0].x, lm[0].y, 1);
+  if (vis(11) && vis(12)) add(...mid(11, 12).map((v, k) => (k ? v + 0.02 : v)), 1); // chest
+  if (vis(23) && vis(24)) add(...mid(23, 24), 1);
+  for (const k of [25, 26]) if (vis(k)) add(lm[k].x, lm[k].y, 1);
+  if (!pts.length) add(t.cx, t.cy, 1);
+
+  const others = (o.others || []).filter(p => p !== t && p.area && p.bbox);
   let box = null;
   if (t.bbox) {
-    const [x0, y0, x1, y1] = t.bbox, pad = 0.02;
-    box = [Math.max(0, x0 - pad) * S, Math.max(0, y0 - pad) * S, Math.min(1, x1 + pad) * S, Math.min(1, y1 + pad) * S];
+    const [x0, y0, x1, y1] = t.bbox;
+    const area = (x1 - x0) * (y1 - y0);
+    const overlaps = others.some(p => {
+      const ix = Math.max(0, Math.min(x1, p.bbox[2]) - Math.max(x0, p.bbox[0]));
+      const iy = Math.max(0, Math.min(y1, p.bbox[3]) - Math.max(y0, p.bbox[1]));
+      return ix * iy > area * 0.08;
+    });
+    const pad = 0.02;
+    if (!overlaps) box = [Math.max(0, x0 - pad) * S, Math.max(0, y0 - pad) * S, Math.min(1, x1 + pad) * S, Math.min(1, y1 + pad) * S];
   }
-  for (const p of o.others || []) {
-    if (p === t || !p.area) continue;
+  for (const p of others) {
     const inside = t.bbox && p.cx > t.bbox[0] && p.cx < t.bbox[2] && p.cy > t.bbox[1] && p.cy < t.bbox[3];
-    if (!inside) { pts.push([p.cx * S, p.cy * S]); labels.push(0); }
+    if (!inside) add(p.cx, p.cy, 0);
   }
   return [pts, labels, box];
 }
