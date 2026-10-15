@@ -12,7 +12,7 @@ const fmtTime = s => {
   return `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
 };
 // SAM 2 tracking on PCs with WebGPU (each GPU is checked against the CPU once, see sam2.js).
-const SAM_ENABLED = false;
+const SAM_ENABLED = true;
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 
 let toastTimer;
