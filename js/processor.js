@@ -676,11 +676,14 @@ export async function extract(o) {
   });
   // One after another, each with its own deadline: in the worker they'd queue behind each other
   // anyway, and a deadline shouldn't count the time spent waiting for the others.
-  const loadGpuModels = async () => {
+  // (After a GPU failure the models are already downloaded, so a restart gets shorter deadlines:
+  // right after the GPU was reset, a new worker sometimes never got going.)
+  const loadGpuModels = async (restart = false) => {
+    const load = restart ? 60000 : LOAD, samLoad = restart ? 120000 : SAM_LOAD;
     const m = o.useMatting === false ? null
-      : await gpu.call('mattingCreate', [aw, ah], { timeout: LOAD }).then(workerMatter).catch(off('matting'));
-    const samOk = o.useSam !== false && !gpu.dead && await gpu.call('samLoad', [], { timeout: SAM_LOAD }).then(() => true, off('SAM 2'));
-    const faceOk = !!o.faceRef && !gpu.dead && await gpu.call('faceLoad', [], { timeout: LOAD }).then(() => true, () => false);
+      : await gpu.call('mattingCreate', [aw, ah], { timeout: load }).then(workerMatter).catch(off('matting'));
+    const samOk = o.useSam !== false && !gpu.dead && await gpu.call('samLoad', [], { timeout: samLoad }).then(() => true, off('SAM 2'));
+    const faceOk = !!o.faceRef && !gpu.dead && await gpu.call('faceLoad', [], { timeout: load }).then(() => true, () => false);
     return [m, samOk, faceOk];
   };
   let [source, [matter, samOk, faceOk]] = await Promise.all([
@@ -817,7 +820,7 @@ export async function extract(o) {
       gpu = gpuWorker();
       configure();
       matter = null;
-      gpuRestarting = loadGpuModels().then(([m, samBack, faceBack]) => {
+      gpuRestarting = loadGpuModels(true).then(([m, samBack, faceBack]) => {
         matter = m;
         samRestart = !!samBack;
         if (faceBack && faceModels) faceModels = { ...faceModels, gpu };
@@ -834,6 +837,19 @@ export async function extract(o) {
         if (m[ay * aw + ax] > 0.5) hit++;
       }
       return hit / 3;
+    };
+    // Hiding on someone else's face: at once if it's somewhere else, but where she was a moment ago a
+    // poor match is more likely her on a bad frame (blur, hair across her face), so look twice there.
+    let lastHer = null, doubted = false;
+    const sawHer = (fc, i) => {
+      lastHer = { x: (fc.box[0] + fc.box[2]) / 2, y: (fc.box[1] + fc.box[3]) / 2, w: fc.box[2] - fc.box[0], i };
+      doubted = false;
+    };
+    const hideFor = (strangers, i) => {
+      const nearHer = fc => lastHer && i - lastHer.i <= fps
+        && Math.hypot((fc.box[0] + fc.box[2]) / 2 - lastHer.x, (fc.box[1] + fc.box[3]) / 2 - lastHer.y) < 1.5 * lastHer.w;
+      if (strangers.every(nearHer) && !doubted) { doubted = true; return false; }
+      return true;
     };
     // SAM prompt for her, found by face on this frame.
     const promptFromFace = async (her, found) => {
@@ -933,6 +949,7 @@ export async function extract(o) {
                 const strangers = found.filter(fc => fc !== her && herFace.other(fc) && clearFace(fc, faceMin * 2) && faceIn(fc, mask) > 0.6);
                 if (her) {
                   faceHidden = false;
+                  sawHer(her, i);
                   // A face right next to hers (someone just behind her) can't be cut away cleanly; ignore it.
                   const apart = fc => Math.hypot((fc.box[0] + fc.box[2] - her.box[0] - her.box[2]) / 2,
                     (fc.box[1] + fc.box[3] - her.box[1] - her.box[3]) / 2) > 1.5 * (her.box[2] - her.box[0]);
@@ -946,8 +963,8 @@ export async function extract(o) {
                   }
                 } else if (strangers.length) {
                   // Someone else's face, clearly, and no sign of hers: don't show them.
-                  faceHidden = true;
-                }
+                  if (hideFor(strangers, i)) faceHidden = true;
+                } else doubted = false;
                 if (globalThis.__fancamDebug) {
                   const core = samRegion?.core, box = [1, 1, 0, 0];
                   if (core) for (let k = 0; k < n; k += 3) if (core[k] > 0.5) { const x = (k % aw) / aw, y = Math.floor(k / aw) / ah; box[0] = Math.min(box[0], x); box[1] = Math.min(box[1], y); box[2] = Math.max(box[2], x); box[3] = Math.max(box[3], y); }
@@ -993,14 +1010,17 @@ export async function extract(o) {
             const byFace = her && await personAtFace(aCanvas, persons, her, r.w, r.h);
             if (byFace) {
               faceHidden = false;
+              sawHer(her, i);
               if (byFace !== person) {
                 person = byFace;
                 tracker.last = byFace; tracker.lost = 0; tracker.vx = tracker.vy = 0;
                 tracker.ref = colourHist(byFace, px);
                 faceFixes++;
               }
-            } else if (person && found.some(fc => herFace.other(fc) && clearFace(fc, faceMin * 2) && personForFace([person], fc, r.w, r.h))) {
-              faceHidden = true;
+            } else {
+              const strangers = person ? found.filter(fc => herFace.other(fc) && clearFace(fc, faceMin * 2) && personForFace([person], fc, r.w, r.h)) : [];
+              if (strangers.length && hideFor(strangers, i)) faceHidden = true;
+              else if (!strangers.length) doubted = false;
             }
             globalThis.__fancamDebug?.push({ i, faces: found.map(fc => ({ sim: +fc.sim.toFixed(3), size: Math.round(fc.size), her: fc === her })), byFace: !!byFace, fixes: faceFixes, hidden: faceHidden });
           }
