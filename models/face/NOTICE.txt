@@ -1,0 +1,6 @@
+Face models from InsightFace (https://github.com/deepinsight/insightface), "buffalo_s" pack (v0.7):
+  det_500m.onnx   SCRFD-500M face detector (with 5 face landmarks)
+  w600k_mbf.onnx  MobileFaceNet face recognition, trained on WebFace600K
+
+The InsightFace pretrained models are available for non-commercial research purposes only.
+This app is a personal, non-commercial tool.

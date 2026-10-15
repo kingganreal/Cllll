@@ -285,6 +285,26 @@ async function fetchMedia(fileId, onBytes) {
   return new Blob(chunks);
 }
 
+// Her face photos (a small JSON file next to the clips): { updated, refs: [...] }.
+export async function getFaces() {
+  const folder = await folderId();
+  const res = await json(`${API}/files?q=${q(
+    `'${folder}' in parents and trashed=false and appProperties has { key='fancamFaces' and value='1' }`,
+  )}&fields=files(id)&spaces=drive`);
+  const f = res.files[0];
+  if (!f) return null;
+  return { fileId: f.id, data: JSON.parse(await (await fetchMedia(f.id)).text()) };
+}
+
+export async function putFaces(data, fileId) {
+  const body = new Blob([JSON.stringify(data)], { type: 'application/json' });
+  if (fileId) {
+    await request(`${UPLOAD}/files/${fileId}?uploadType=media`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body });
+  } else {
+    await resumableUpload({ name: '설윤 얼굴 사진.json', parents: [await folderId()], mimeType: 'application/json', appProperties: { fancamFaces: '1' } }, body);
+  }
+}
+
 export async function downloadClip(entry, onProgress) {
   let got = 0;
   const video = await fetchMedia(entry.video.id, n => { got += n; onProgress?.(Math.min(1, got / Math.max(entry.size, 1))); });

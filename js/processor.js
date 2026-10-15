@@ -7,6 +7,7 @@ import { Muxer, StreamTarget } from '../vendor/mp4-muxer/mp4-muxer.mjs';
 import { openSource, seekVideo } from './source.js';
 import * as matting from './matting.js';
 import * as sam2 from './sam2.js';
+import * as face from './face.js';
 
 export { seekVideo as seek };
 
@@ -37,7 +38,7 @@ export function getLandmarker() {
       // person it already has and never notices a second one, so it can slide onto another
       // member when two cross. Tracker below does the following instead.
       runningMode: 'IMAGE',
-      numPoses: 5,
+      numPoses: 8, // a whole group (NMIXX is six) plus a dancer or two
       outputSegmentationMasks: true,
       minPoseDetectionConfidence: 0.35,
       minPosePresenceConfidence: 0.35,
@@ -525,8 +526,11 @@ function samPrompt(o) {
 
 // SAM's 256x256 mask (of the square-squashed frame) -> a soft region at analysis size, grown a
 // little (more when SAM only runs every few frames, to cover her movement in between).
+// region.inner is her body shrunk away from the outline: solid for sure, whatever the matting
+// model thinks (it sometimes turns a dress or an arm see-through against a similar background).
 function makeSamRegion(w, h) {
   const n = w * h, core = new Float32Array(n), tmp = new Float32Array(n), grown = new Float32Array(n);
+  const hard = new Float32Array(n), shrunk = new Float32Array(n);
   return (low, every) => {
     for (let y = 0; y < h; y++) {
       const fy = Math.max(0, (y + 0.5) / h * 256 - 0.5), y0 = Math.floor(fy), y1 = Math.min(255, y0 + 1), wy = fy - y0;
@@ -537,13 +541,79 @@ function makeSamRegion(w, h) {
         core[y * w + x] = 1 / (1 + Math.exp(-v));
       }
     }
-    const r = Math.max(2, Math.round(Math.max(w, h) * (0.012 + 0.006 * (every - 1))));
+    const side = Math.max(w, h);
+    const r = Math.max(2, Math.round(side * (0.012 + 0.006 * (every - 1))));
     boxMean(core, w, h, r, grown, tmp);
     const region = new Float32Array(n);
     for (let k = 0; k < n; k++) region[k] = Math.min(1, Math.max(core[k], grown[k] * 2.5));
+    for (let k = 0; k < n; k++) hard[k] = core[k] > 0.5 ? 1 : 0;
+    boxMean(hard, w, h, Math.max(2, Math.round(side * (0.01 + 0.005 * (every - 1)))), shrunk, tmp);
+    const inner = new Float32Array(n);
+    for (let k = 0; k < n; k++) { const v = (shrunk[k] - 0.92) / 0.08; inner[k] = v <= 0 ? 0 : v >= 1 ? 1 : v; }
     region.core = core.slice();
+    region.inner = inner;
     return region;
   };
+}
+
+// Which pose-model person a face belongs to: the one whose nose/eyes fall inside the face box.
+export function personForFace(persons, fc, rw, rh) {
+  const [x0, y0, x1, y1] = [fc.box[0] / rw, fc.box[1] / rh, fc.box[2] / rw, fc.box[3] / rh];
+  const padX = (x1 - x0) * 0.25, padY = (y1 - y0) * 0.25;
+  let best = null, bestHits = 0;
+  for (const p of persons) {
+    let hits = 0;
+    for (const i of [0, 2, 5]) {
+      const l = p.landmarks?.[i];
+      if (l && l.x > x0 - padX && l.x < x1 + padX && l.y > y0 - padY && l.y < y1 + padY) hits++;
+    }
+    if (hits > bestHits) { bestHits = hits; best = p; }
+  }
+  if (best) return best;
+  // No skeleton matched: the person whose outline covers the middle of the face.
+  const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
+  for (const p of persons) {
+    const x = Math.min(p.w - 1, Math.round(cx * p.w)), y = Math.min(p.h - 1, Math.round(cy * p.h));
+    if (p.mask[y * p.w + x] > 0.5) return p;
+  }
+  return null;
+}
+
+// The pose model misses people in a crowd (it finds a handful per frame). If nobody matches
+// her face, look again at a crop around it (her body hangs below her face), and map that person
+// back onto the whole frame. `src` is the frame at analysis size, like `persons`' masks.
+export async function personAtFace(src, persons, fc, rw, rh) {
+  const hit = personForFace(persons, fc, rw, rh);
+  if (hit) return hit;
+  const W = src.width, H = src.height;
+  const fx0 = fc.box[0] / rw * W, fy0 = fc.box[1] / rh * H, fx1 = fc.box[2] / rw * W, fy1 = fc.box[3] / rh * H;
+  const fw = fx1 - fx0, fh = fy1 - fy0;
+  const x0 = Math.max(0, Math.floor(fx0 - 2.5 * fw)), x1 = Math.min(W, Math.ceil(fx1 + 2.5 * fw));
+  const y0 = Math.max(0, Math.floor(fy0 - fh)), y1 = Math.min(H, Math.ceil(fy1 + 8 * fh));
+  const cw = x1 - x0, ch = y1 - y0;
+  if (cw < 16 || ch < 16) return null;
+  const c = document.createElement('canvas');
+  c.width = cw; c.height = ch;
+  c.getContext('2d').drawImage(src, x0, y0, cw, ch, 0, 0, cw, ch);
+  const inCrop = { ...fc, box: [fx0 - x0, fy0 - y0, fx1 - x0, fy1 - y0] };
+  const p = personForFace(await detect(c), inCrop, cw, ch);
+  if (!p) return null;
+  const mask = new Float32Array(W * H);
+  for (let y = 0; y < ch; y++) {
+    const sy = Math.min(p.h - 1, Math.floor(y * p.h / ch));
+    for (let x = 0; x < cw; x++) mask[(y0 + y) * W + x0 + x] = p.mask[sy * p.w + Math.min(p.w - 1, Math.floor(x * p.w / cw))];
+  }
+  const landmarks = p.landmarks.map(l => ({ ...l, x: (l.x * cw + x0) / W, y: (l.y * ch + y0) / H }));
+  return describe(mask, W, H, landmarks);
+}
+
+// A face clear enough to say "that's not her": big enough and turned mostly towards the camera
+// (a profile can fool the recogniser even for the same person).
+function clearFace(fc, minSize) {
+  const [le, re, nose] = fc.kps;
+  const eyes = Math.hypot(re[0] - le[0], re[1] - le[1]);
+  const t = ((nose[0] - le[0]) * (re[0] - le[0]) + (nose[1] - le[1]) * (re[1] - le[1])) / (eyes * eyes || 1);
+  return fc.size >= minSize && eyes > 0.3 * (fc.box[2] - fc.box[0]) && t > 0.25 && t < 0.75;
 }
 
 // ---------------------------------------------------------------------------
@@ -567,6 +637,8 @@ const breathe = () => (globalThis.scheduler?.yield ? scheduler.yield() : new Pro
  * @param {[number, number]} [o.tap] where she was tapped on the pick frame (0..1 coords), if tapped
  * @param {object[]} [o.others]      the other people found on the pick frame
  * @param {{requested: boolean}} [o.stop] set requested=true to finish early and keep what's done
+ * @param {Float32Array} [o.faceRef]  her face (face.reference of the registered photos): checked
+ *   every half second, and the tracker is put back on her if it has drifted to someone else
  * @param {(p:object)=>void} o.onProgress
  * @param {AbortSignal} o.signal
  */
@@ -584,11 +656,12 @@ export async function extract(o) {
   const alphaX = layout === 'sbs' ? hw : 0, alphaY = layout === 'sbs' ? 0 : hh;
 
   o.onProgress?.({ done: 0, total: 1, elapsed: 0, eta: 0, stage: '준비 중' });
-  let [source, matter, samModels] = await Promise.all([
+  let [source, matter, samModels, faceModels] = await Promise.all([
     openSource(o.file, video),
     o.useMatting === false ? null : matting.createMatter(aw, ah).catch(err => { console.warn('matting off:', err); return null; }),
     o.useSam === false ? null : sam2.load(f => o.onProgress?.({ done: 0, total: 1, elapsed: 0, eta: 0, stage: `SAM 2 추적 모델 받는 중 ${Math.round(f * 100)}%` }))
       .catch(err => { console.warn('SAM 2 off:', err); return null; }),
+    o.faceRef ? face.load().catch(err => { console.warn('face check off:', err); return null; }) : null,
   ]);
   const cleanup = [() => source.close()];
   try {
@@ -668,6 +741,47 @@ export async function extract(o) {
     const toRegion = sam ? makeSamRegion(aw, ah) : null;
     let samRegion = null, samSeen = true, samSince = 0;
 
+    // Face check: every half second, find her face among everyone's; if the tracker's mask
+    // isn't on her face (or also covers someone else's), start it again on her.
+    const faceEvery = samEvery * Math.max(1, Math.round(fps * 0.5 / samEvery));
+    const faceMin = Math.max(r.w, r.h) * 0.012;       // smallest face worth recognising
+    let faceHidden = false, faceStrikes = 0, faceFixes = 0;
+    const lookForFaces = async f => {
+      try {
+        const found = await face.faces(faceModels, ctx => f.draw(ctx, r, r.w, r.h), r.w, r.h, { minSize: faceMin });
+        return { found, her: face.findHer(found, o.faceRef) };
+      } catch (err) {
+        console.warn('face check failed:', err);
+        return { found: [], her: null };
+      }
+    };
+    // How much of a face (eyes and nose) lies inside a mask at analysis size.
+    const faceIn = (fc, m) => {
+      if (!m) return 0;
+      let hit = 0;
+      for (const [x, y] of fc.kps.slice(0, 3)) {
+        const ax = Math.min(aw - 1, Math.max(0, Math.round(x / r.w * aw))), ay = Math.min(ah - 1, Math.max(0, Math.round(y / r.h * ah)));
+        if (m[ay * aw + ax] > 0.5) hit++;
+      }
+      return hit / 3;
+    };
+    // SAM prompt for her, found by face on this frame.
+    const promptFromFace = async (her, found) => {
+      const persons = await detect(aCanvas);
+      const target = await personAtFace(aCanvas, persons, her, r.w, r.h);
+      const cx = (her.box[0] + her.box[2]) / 2 / r.w, cy = (her.box[1] + her.box[3]) / 2 / r.h;
+      const [pts, labels, box] = samPrompt({
+        target: target || { cx, cy, landmarks: [], bbox: null }, tap: [cx, cy],
+        others: persons.filter(p => p !== target),
+      });
+      for (const fc of found) {
+        if (fc === her) continue;
+        const x = (fc.box[0] + fc.box[2]) / 2 / r.w, y = (fc.box[1] + fc.box[3]) / 2 / r.h;
+        pts.push([x * sam2.SIZE, y * sam2.SIZE]); labels.push(0);
+      }
+      return [pts, labels, box];
+    };
+
     const bounds = [1, 1, 0, 0];
     let thumbnail = null, found = true;
     const t0 = performance.now();
@@ -695,10 +809,35 @@ export async function extract(o) {
               if (!(await sam2.gpuTrusted(samModels, input, ...samPrompt(o)))) throw new Error('GPU result differs from CPU');
             }
             const out = i === 0 ? await sam.start(input, ...samPrompt(o)) : await sam.next(input);
-            if (i === 0 && out.score <= 0) throw new Error('SAM 2 could not find her on the first frame');
+            if (i === 0 && out.score <= 0 && !faceModels) throw new Error('SAM 2 could not find her on the first frame');
             samSeen = out.score > 0;
             samRegion = samSeen ? toRegion(out.low, samEvery) : null;
             samSince = 0;
+
+            if (faceModels && i % faceEvery === 0) {
+              const { found, her } = await lookForFaces(f);
+              check();
+              const mask = samRegion?.core;
+              const strangers = found.filter(fc => fc !== her && fc.sim < face.OTHER && clearFace(fc, faceMin * 2) && faceIn(fc, mask) > 0.6);
+              if (her) {
+                faceHidden = false; faceStrikes = 0;
+                // A face right next to hers (someone just behind her) can't be cut away cleanly; ignore it.
+                const apart = fc => Math.hypot((fc.box[0] + fc.box[2] - her.box[0] - her.box[2]) / 2,
+                  (fc.box[1] + fc.box[3] - her.box[1] - her.box[3]) / 2) > 1.5 * (her.box[2] - her.box[0]);
+                if (faceIn(her, mask) < 0.6 || strangers.some(apart)) {
+                  // Drifted (or spread onto someone else): start again from her face.
+                  sam = new sam2.Tracker(samModels);
+                  const again = await sam.start(input, ...(await promptFromFace(her, found)));
+                  samSeen = again.score > 0;
+                  samRegion = samSeen ? toRegion(again.low, samEvery) : null;
+                  faceFixes++;
+                }
+              } else if (strangers.length) {
+                // Someone else's face, clearly, and no sign of hers: don't show them.
+                if (++faceStrikes >= 2) faceHidden = true;
+              } else faceStrikes = 0;
+              globalThis.__fancamDebug?.push({ i, faces: found.map(fc => ({ sim: +fc.sim.toFixed(3), size: Math.round(fc.size), in: faceIn(fc, samRegion?.core), her: fc === her })), fixes: faceFixes, hidden: faceHidden });
+            }
           } else samSince++;
         } catch (err) {
           if (err.name === 'AbortError') throw err;
@@ -708,25 +847,45 @@ export async function extract(o) {
       }
 
       if (sam) {
-        found = samSeen;
+        found = samSeen && !faceHidden;
         let pha = null;
         if (matter) {
           try { pha = await matter.run(px); } catch (err) { console.warn('GPU matting failed:', err); matter = null; }
         }
-        if (pha && samRegion) {
-          for (let k = 0; k < n; k++) { const v = pha[k] * samRegion[k]; alpha[k] = v < 0.02 ? 0 : v; }
-        } else if (samRegion) {
+        if (faceHidden || !samRegion) {
+          alpha.fill(0); // not her (or SAM says she isn't in view)
+        } else if (pha) {
+          const inner = samRegion.inner;
+          for (let k = 0; k < n; k++) { const v = Math.max(pha[k] * samRegion[k], inner[k]); alpha[k] = v < 0.02 ? 0 : v; }
+        } else {
           // No matting model: snap SAM's soft mask to colour edges instead.
           for (let k = 0, j = 0; k < n; k++, j += 4) guide[k] = (0.299 * px[j] + 0.587 * px[j + 1] + 0.114 * px[j + 2]) / 255;
           guided(guide, samRegion.core, radius, 0.004, refined);
           for (let k = 0; k < n; k++) { const v = (refined[k] - 0.3) / 0.4; alpha[k] = v < 0 ? 0 : v > 1 ? 1 : v; }
-        } else {
-          alpha.fill(0); // SAM says she isn't in view
         }
       } else {
         const persons = await detect(aCanvas);
         await breathe(); check();
-        const person = persons.length && persons[0].w === aw ? tracker.update(persons, px) : (tracker.lost++, null);
+        let person = persons.length && persons[0].w === aw ? tracker.update(persons, px) : (tracker.lost++, null);
+        if (faceModels && i % faceEvery === 0 && persons.length && persons[0].w === aw) {
+          // Her face says who she is: follow that person, and drop someone who clearly isn't her.
+          const { found, her } = await lookForFaces(f);
+          check();
+          const byFace = her && await personAtFace(aCanvas, persons, her, r.w, r.h);
+          if (byFace) {
+            faceHidden = false; faceStrikes = 0;
+            if (byFace !== person) {
+              person = byFace;
+              tracker.last = byFace; tracker.lost = 0; tracker.vx = tracker.vy = 0;
+              tracker.ref = colourHist(byFace, px);
+              faceFixes++;
+            }
+          } else if (person && found.some(fc => fc.sim < face.OTHER && clearFace(fc, faceMin * 2) && personForFace([person], fc, r.w, r.h))) {
+            if (++faceStrikes >= 2) faceHidden = true;
+          } else faceStrikes = 0;
+          globalThis.__fancamDebug?.push({ i, faces: found.map(fc => ({ sim: +fc.sim.toFixed(3), size: Math.round(fc.size), her: fc === her })), byFace: !!byFace, fixes: faceFixes, hidden: faceHidden });
+        }
+        if (faceHidden) person = null;
         const others = person ? persons.filter(q => q !== person && q.w === aw && q.h === ah) : [];
         found = !!person;
         globalThis.__fancamDebug?.push({ i, n: persons.length, lost: tracker.lost,
@@ -816,7 +975,7 @@ export async function extract(o) {
       const elapsed = (performance.now() - t0) / 1000;
       o.onProgress?.({
         done: i + 1, total, elapsed, eta: elapsed / (i + 1) * (total - i - 1),
-        preview: out, layout, found, matting: !!matter, sam: !!sam, decoder: source.kind,
+        preview: out, layout, found, matting: !!matter, sam: !!sam, face: !!faceModels, fixes: faceFixes, decoder: source.kind,
       });
     }
     check();

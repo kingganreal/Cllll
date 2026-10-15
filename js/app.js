@@ -13,6 +13,8 @@ const fmtTime = s => {
 };
 // SAM 2 tracking on PCs with WebGPU (each GPU is checked against the CPU once, see sam2.js).
 const SAM_ENABLED = true;
+// Finding her by face (js/face.js): stays off until it has been tested end to end.
+const FACE_ENABLED = false;
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 
 let toastTimer;
@@ -422,6 +424,23 @@ const cloud = {
       requestPersistence();
       library.refresh();
     }
+
+    // 5. Her face photos: the newer list wins.
+    try {
+      const local = await faces.get();
+      const remoteFaces = await drive.getFaces();
+      const ru = remoteFaces?.data?.updated || 0;
+      if (ru > local.updated) {
+        faces.data = remoteFaces.data;
+        await kv.set('faces', remoteFaces.data);
+        if (current === 'create') faces.render();
+      } else if (local.updated > ru) {
+        await drive.putFaces(local, remoteFaces?.fileId);
+      }
+    } catch (err) {
+      if (drive.isSignInError(err)) throw err;
+      console.warn('face photos not synced', err);
+    }
   },
 
   renderPanel() {
@@ -502,6 +521,96 @@ document.addEventListener('visibilitychange', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Her face: a few photos registered once (shared through Drive), used to tell her from the
+// other members when picking and while making a clip (see js/face.js).
+
+const faces = {
+  data: null, // { updated, refs: [{ id, emb: number[512], thumb: data URL }] }
+
+  async get() {
+    this.data ??= (await kv.get('faces').catch(() => null)) || { updated: 0, refs: [] };
+    return this.data;
+  },
+  async save(data) {
+    this.data = { ...data, updated: Date.now() };
+    await kv.set('faces', this.data);
+    this.render();
+    cloud.kick();
+  },
+  async reference() {
+    if (!FACE_ENABLED) return null;
+    const { refs } = await this.get();
+    if (!refs.length) return null;
+    return (await import('./face.js')).reference(refs.map(r => r.emb));
+  },
+
+  async render() {
+    const { refs } = await this.get();
+    const list = $('#faces-list');
+    list.replaceChildren(...refs.map(ref => {
+      const el = document.createElement('div');
+      el.className = 'face-thumb';
+      const img = document.createElement('img');
+      img.src = ref.thumb; img.alt = '';
+      const x = document.createElement('button');
+      x.type = 'button'; x.className = 'face-remove'; x.textContent = '×'; x.title = '지우기';
+      x.onclick = async () => {
+        const d = await this.get();
+        await this.save({ ...d, refs: d.refs.filter(r => r.id !== ref.id) });
+      };
+      el.append(img, x);
+      return el;
+    }));
+    $('#faces-count').textContent = refs.length ? `${refs.length}장 등록됨` : '아직 없음';
+  },
+
+  async add(files) {
+    const btn = $('#faces-add');
+    const label = btn.textContent;
+    btn.textContent = '얼굴 찾는 중…';
+    try {
+      const f = await import('./face.js');
+      const m = await f.load();
+      const d = await this.get();
+      const refs = [...d.refs];
+      let added = 0;
+      for (const file of files) {
+        let bmp;
+        try { bmp = await createImageBitmap(file); } catch { toast(`"${file.name}"은 사진으로 열 수 없어요`); continue; }
+        const found = await f.faces(m, ctx => ctx.drawImage(bmp, 0, 0), bmp.width, bmp.height, { minSize: 24 });
+        if (!found.length) { toast(`"${file.name}"에서 얼굴을 찾지 못했어요. 얼굴이 크게 나온 사진으로 넣어 주세요.`, 4000); continue; }
+        // The biggest face is hers (a group photo would be ambiguous, so say so).
+        const fc = found.reduce((a, b) => (b.box[2] - b.box[0] > a.box[2] - a.box[0] ? b : a));
+        if (found.length > 1) toast('사진에 얼굴이 여러 개라 가장 큰 얼굴을 썼어요. 혼자 나온 사진이 더 좋아요.', 4000);
+        const ref = refs.length && f.reference(refs.map(r => r.emb));
+        if (ref && f.similarity2(fc.emb, ref) < 0.2) toast('앞서 넣은 사진들과 다른 사람 같아요. 맞는지 확인해 주세요.', 4500);
+        const [x0, y0, x1, y1] = fc.box, side = Math.max(x1 - x0, y1 - y0) * 1.3;
+        const c = document.createElement('canvas'); c.width = c.height = 96;
+        c.getContext('2d').drawImage(bmp, (x0 + x1) / 2 - side / 2, (y0 + y1) / 2 - side / 2, side, side, 0, 0, 96, 96);
+        refs.push({ id: uid(), emb: Array.from(fc.emb, v => +v.toFixed(5)), thumb: c.toDataURL('image/jpeg', 0.85) });
+        bmp.close();
+        added++;
+      }
+      if (added) {
+        await this.save({ ...d, refs });
+        toast(refs.length < 3 ? `${added}장 등록했어요. 3장 이상이면 더 정확해요.` : `${added}장 등록했어요.`);
+      }
+    } catch (err) {
+      console.error(err);
+      toast('얼굴 모델을 불러오지 못했어요: ' + err.message, 4000);
+    } finally {
+      btn.textContent = label;
+    }
+  },
+};
+
+$('#faces-input').addEventListener('change', e => {
+  const files = [...e.target.files];
+  e.target.value = '';
+  if (files.length) faces.add(files);
+});
+
+// ---------------------------------------------------------------------------
 // Create (extract a member from a fancam)
 
 const create = {
@@ -517,6 +626,8 @@ const create = {
   },
 
   enter() {
+    $('#faces').hidden = !FACE_ENABLED;
+    if (FACE_ENABLED) faces.render();
     // "새 클립 만들기" always starts from an empty page, not the last video.
     if (!this.busy && !youtubeHelper.busy && capture.recorder?.state !== 'recording') this.clear();
     const warn = [];
@@ -628,7 +739,28 @@ const create = {
       }
       this.target = p.pickDefault(this.persons);
       this.tap = null;
+      this.tapped = false;
       this.pickApi = p;
+      // With her face registered, pick her by face.
+      this.faceFound = null;
+      const ref = await faces.reference();
+      if (ref) {
+        btn.textContent = '얼굴 찾는 중…';
+        try {
+          const f = await import('./face.js');
+          const m = await f.load();
+          const found = await f.faces(m, ctx => ctx.drawImage(v, r.x, r.y, r.w, r.h, 0, 0, r.w, r.h), r.w, r.h,
+            { minSize: Math.max(r.w, r.h) * 0.012 });
+          const her = f.findHer(found, ref);
+          const who = her && await p.personAtFace(c, this.persons, her, r.w, r.h);
+          this.faceFound = !!who;
+          if (who) {
+            if (!this.persons.includes(who)) this.persons.push(who);
+            this.target = who;
+            this.tap = [(her.box[0] + her.box[2]) / 2 / r.w, (her.box[1] + her.box[3]) / 2 / r.h];
+          }
+        } catch (err) { console.warn('face pick failed', err); }
+      }
       // Start fetching the SAM 2 tracker now (PC with WebGPU), so it's ready when 추출 starts.
       if (SAM_ENABLED) import('./sam2.js').then(m => m.load()).catch(() => {});
       this.drawPick();
@@ -655,10 +787,12 @@ const create = {
       const iy = Math.max(0, Math.min(t.bbox[3], p.bbox[3]) - Math.max(t.bbox[1], p.bbox[1]));
       return ix * iy > (t.bbox[2] - t.bbox[0]) * (t.bbox[3] - t.bbox[1]) * 0.08;
     });
-    hint.textContent = overlap
-      ? '고른 멤버가 다른 멤버와 겹쳐 있어요. 혼자 잘 보이는 장면을 시작 지점으로 고르면 더 정확해요.'
-      : '따낼 멤버를 탭하세요. 분홍색으로 표시된 사람만 남아요.';
-    hint.classList.toggle('warn', !!overlap);
+    const byFace = this.faceFound && !this.tapped;
+    hint.textContent = (byFace ? '얼굴로 설윤을 찾았어요. ' : this.faceFound === false && !this.tapped ? '이 장면에선 얼굴로 못 찾았어요. 직접 탭해 주세요 (만드는 동안에도 얼굴로 계속 확인해요). ' : '')
+      + (overlap
+        ? '고른 멤버가 다른 멤버와 겹쳐 있어요. 혼자 잘 보이는 장면을 시작 지점으로 고르면 더 정확해요.'
+        : byFace ? '아니면 탭해서 바꿀 수 있어요.' : '따낼 멤버를 탭하세요. 분홍색으로 표시된 사람만 남아요.');
+    hint.classList.toggle('warn', !!overlap || (this.faceFound === false && !this.tapped));
   },
 
   drawPick() {
@@ -708,12 +842,12 @@ const create = {
     const opts = {
       file: this.file, video: v, start: this.start, end: this.end, target: this.target, rect: this.rect(),
       tap: this.tap, others: this.persons, stop: (this.stopFlag = { requested: false }),
-      useSam: SAM_ENABLED,
+      useSam: SAM_ENABLED, faceRef: await faces.reference(),
       fps: Number($('#fps').value), maxSide: Number($('#quality').value),
       withAudio: $('#with-audio').checked,
     };
-    // ~4 Mbps at 960, ~7 at 1280, ~12 at 1920 (30fps)
-    opts.bitrate = Math.round(opts.maxSide * opts.maxSide * (opts.maxSide >= 1920 ? 3.2 : 2.2) * opts.fps / 30);
+    // ~3.7 Mbps at 960, ~6.5 at 1280, ~15 at 1920 (30fps): the cut-out's edges need the bits.
+    opts.bitrate = Math.round(opts.maxSide * opts.maxSide * 4 * opts.fps / 30);
     const name = $('#clip-name').value.trim() || '설윤';
 
     this.busy = true;
@@ -732,7 +866,8 @@ const create = {
       if (info.stage) { $('#progress-text').textContent = info.stage + '…'; return; }
       const pct = info.done / info.total * 100;
       $('#progress-bar').style.width = pct.toFixed(1) + '%';
-      const mode = info.sam ? 'SAM 2 추적 + GPU 누끼' : info.matting ? 'GPU 고급 누끼' : '기본 누끼';
+      const mode = (info.sam ? 'SAM 2 추적 + GPU 누끼' : info.matting ? 'GPU 고급 누끼' : '기본 누끼')
+        + (info.face ? ` + 얼굴 확인${info.fixes ? ` (${info.fixes}번 바로잡음)` : ''}` : '');
       $('#progress-text').textContent =
         `${info.done} / ${info.total} 프레임 · ${pct.toFixed(0)}% · 남은 시간 약 ${fmtTime(info.eta)}\n${mode}${info.found ? '' : ' · 멤버를 놓쳐서 다시 찾는 중'}`;
       const now = performance.now();
@@ -833,6 +968,7 @@ $('#pick-canvas').addEventListener('click', e => {
   const nx = (e.clientX - r.left) / r.width, ny = (e.clientY - r.top) / r.height;
   create.target = create.pickApi.pickAt(create.persons, nx, ny);
   create.tap = [nx, ny];
+  create.tapped = true;
   create.drawPick();
 });
 $('#btn-start').addEventListener('click', () => create.run());
