@@ -95,6 +95,10 @@ Releases에 올려요. 새 버전을 내려면 `desktop/package.json`의 `versio
 
 처리는 프레임마다 AI를 돌려서 영상 길이보다 오래 걸릴 수 있어요(기기 성능에 따라 차이가 커요).
 
+- **SAM 2 추적**: WebGPU가 되는 브라우저(PC의 Chrome·Edge)에서는 메타의 영상 추적 모델 SAM 2.1(tiny)이
+  처음에 탭한 멤버를 기억해서 끝까지 따라가요. 옆에 붙어 있거나 앞을 지나가는 멤버로 바뀌지 않아요.
+  처음 한 번 모델(약 100MB)을 받아요. 몇 프레임마다 한 번씩 돌고, 사이 프레임은 누끼 모델이 채워요.
+- **여기까지 저장**: 처리 중에 누르면 지금까지 된 부분만(소리도 그 길이까지) 클립으로 저장해요.
 - **GPU 고급 누끼**: WebGPU가 되는 브라우저(PC의 Chrome·Edge, 최신 Safari)에서는 영상용 누끼 모델(RVM)로
   머리카락·손끝·치마 같은 테두리를 깔끔하게 따요. 처음 한 번 모델(약 40MB)을 받아요. 안 되는 기기에서는 기본 누끼로 해요.
 - 멤버끼리 겹칠 때는 그 멤버의 뼈대(관절 위치) 주변만 남겨서 다른 멤버가 섞이지 않게 해요.
@@ -125,6 +129,7 @@ index.html          화면 (보관함 / 만들기 / 무대)
 js/processor.js     추출: 사람 찾기 → 대상 추적(겹침·옷 색·움직임·화면 중앙) → 누끼 → 인코딩
 js/source.js        영상을 처음부터 순서대로 디코딩 (web-demuxer + WebCodecs, 안 되면 탐색 방식)
 js/matting.js       GPU 고급 누끼 (RVM, onnxruntime-web WebGPU)
+js/sam2.js          SAM 2 영상 추적 (ailia-models의 스트리밍 비디오 예측기를 옮긴 것)
 js/player.js        재생: 색|투명도로 나란히 담긴 MP4를 WebGL로 합쳐 투명하게 그리기
 js/store.js         IndexedDB 저장
 js/drive.js         구글 드라이브로 기기 간 동기화
@@ -137,7 +142,8 @@ js/app.js           UI, 무대 조작
 sw.js               오프라인 캐시
 vendor/, models/    MediaPipe tasks-vision 1.0.1, mp4-muxer 5.2.2, web-demuxer 4.0.0, onnxruntime-web 1.30.0,
                     pose_landmarker_full, RVM mobilenetv3 (GPL-3.0, models/RVM-LICENSE.txt;
-                    WebGPU에서 정확히 돌도록 일부 합성곱 입력을 0 채널로 채우고 AveragePool ceil_mode를 끈 수정본)
+                    WebGPU에서 정확히 돌도록 일부 합성곱 입력을 0 채널로 채우고 AveragePool ceil_mode를 끈 수정본),
+                    SAM 2.1 hiera-tiny (Apache-2.0, ailia-models의 ONNX 내보내기를 onnxsim으로 단순화하고 가중치를 fp16으로 저장)
 ```
 
 투명 영상을 모든 기기에서 재생하려고, 결과물은 한 프레임에 **색(왼쪽)과 투명도(오른쪽)**를 나란히 담은

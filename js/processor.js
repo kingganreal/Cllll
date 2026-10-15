@@ -6,6 +6,7 @@ import { PoseLandmarker } from '../vendor/mediapipe/vision_bundle.mjs';
 import { Muxer, StreamTarget } from '../vendor/mp4-muxer/mp4-muxer.mjs';
 import { openSource, seekVideo } from './source.js';
 import * as matting from './matting.js';
+import * as sam2 from './sam2.js';
 
 export { seekVideo as seek };
 
@@ -454,10 +455,10 @@ async function prepareAudio(file, start, end) {
   return null;
 }
 
-async function encodeAudio(audio, muxer) {
+async function encodeAudio(audio, out) {
   let failure = null;
   const encoder = new AudioEncoder({
-    output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
+    output: (chunk, meta) => out.push({ chunk, meta }),
     error: e => { failure = e; },
   });
   encoder.configure(audio.config);
@@ -483,6 +484,52 @@ async function encodeAudio(audio, muxer) {
 }
 
 // ---------------------------------------------------------------------------
+// SAM 2 helpers
+
+// The first frame's prompt: where she was tapped (or her middle), a box around her whole body,
+// and "not her" points on the other people found next to her.
+function samPrompt(o) {
+  const S = sam2.SIZE, t = o.target;
+  const pts = [], labels = [];
+  const [tx, ty] = o.tap ?? [t.cx, t.cy];
+  pts.push([tx * S, ty * S]); labels.push(1);
+  let box = null;
+  if (t.bbox) {
+    const [x0, y0, x1, y1] = t.bbox, pad = 0.02;
+    box = [Math.max(0, x0 - pad) * S, Math.max(0, y0 - pad) * S, Math.min(1, x1 + pad) * S, Math.min(1, y1 + pad) * S];
+  }
+  for (const p of o.others || []) {
+    if (p === t || !p.area) continue;
+    const inside = t.bbox && p.cx > t.bbox[0] && p.cx < t.bbox[2] && p.cy > t.bbox[1] && p.cy < t.bbox[3];
+    if (!inside) { pts.push([p.cx * S, p.cy * S]); labels.push(0); }
+  }
+  return [pts, labels, box];
+}
+
+// SAM's 256x256 mask (of the square-squashed frame) -> a soft region at analysis size, grown a
+// little (more when SAM only runs every few frames, to cover her movement in between).
+function makeSamRegion(w, h) {
+  const n = w * h, core = new Float32Array(n), tmp = new Float32Array(n), grown = new Float32Array(n);
+  return (low, every) => {
+    for (let y = 0; y < h; y++) {
+      const fy = Math.max(0, (y + 0.5) / h * 256 - 0.5), y0 = Math.floor(fy), y1 = Math.min(255, y0 + 1), wy = fy - y0;
+      for (let x = 0; x < w; x++) {
+        const fx = Math.max(0, (x + 0.5) / w * 256 - 0.5), x0 = Math.floor(fx), x1 = Math.min(255, x0 + 1), wx = fx - x0;
+        const v = (low[y0 * 256 + x0] * (1 - wx) + low[y0 * 256 + x1] * wx) * (1 - wy)
+          + (low[y1 * 256 + x0] * (1 - wx) + low[y1 * 256 + x1] * wx) * wy;
+        core[y * w + x] = 1 / (1 + Math.exp(-v));
+      }
+    }
+    const r = Math.max(2, Math.round(Math.max(w, h) * (0.012 + 0.006 * (every - 1))));
+    boxMean(core, w, h, r, grown, tmp);
+    const region = new Float32Array(n);
+    for (let k = 0; k < n; k++) region[k] = Math.min(1, Math.max(core[k], grown[k] * 2.5));
+    region.core = core.slice();
+    return region;
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Main pipeline
 
 const abortError = () => new DOMException('취소됨', 'AbortError');
@@ -499,6 +546,10 @@ const breathe = () => (globalThis.scheduler?.yield ? scheduler.yield() : new Pro
  * @param {number} o.fps, o.maxSide, o.bitrate
  * @param {boolean} o.withAudio
  * @param {boolean} [o.useMatting]  use the GPU matting model when available (default true)
+ * @param {boolean} [o.useSam]      follow her with SAM 2 when WebGPU is available (default true)
+ * @param {[number, number]} [o.tap] where she was tapped on the pick frame (0..1 coords), if tapped
+ * @param {object[]} [o.others]      the other people found on the pick frame
+ * @param {{requested: boolean}} [o.stop] set requested=true to finish early and keep what's done
  * @param {(p:object)=>void} o.onProgress
  * @param {AbortSignal} o.signal
  */
@@ -516,9 +567,11 @@ export async function extract(o) {
   const alphaX = layout === 'sbs' ? hw : 0, alphaY = layout === 'sbs' ? 0 : hh;
 
   o.onProgress?.({ done: 0, total: 1, elapsed: 0, eta: 0, stage: '준비 중' });
-  let [source, matter] = await Promise.all([
+  let [source, matter, samModels] = await Promise.all([
     openSource(o.file, video),
     o.useMatting === false ? null : matting.createMatter(aw, ah).catch(err => { console.warn('matting off:', err); return null; }),
+    o.useSam === false ? null : sam2.load(f => o.onProgress?.({ done: 0, total: 1, elapsed: 0, eta: 0, stage: `SAM 2 추적 모델 받는 중 ${Math.round(f * 100)}%` }))
+      .catch(err => { console.warn('SAM 2 off:', err); return null; }),
   ]);
   const cleanup = [() => source.close()];
   try {
@@ -544,18 +597,23 @@ export async function extract(o) {
       firstTimestampBehavior: 'offset',
     });
 
-    let hasAudio = false;
+    // Audio goes into the file alongside the video (so stopping early can cut it at the same point).
+    const audioChunks = [];
     if (audioOut && source.audio && !reencode) {
-      let first = true;
       for await (const chunk of source.audioChunks(start, end, signal)) {
-        muxer.addAudioChunk(chunk, first ? { decoderConfig: source.audio.config } : undefined);
-        first = false;
-        hasAudio = true;
+        audioChunks.push({ chunk, meta: audioChunks.length ? undefined : { decoderConfig: source.audio.config } });
       }
     } else if (reencode) {
-      await encodeAudio(reencode, muxer);
-      hasAudio = true;
+      await encodeAudio(reencode, audioChunks);
     }
+    const hasAudio = audioChunks.length > 0;
+    let audioNext = 0;
+    const addAudioUntil = us => {
+      while (audioNext < audioChunks.length && audioChunks[audioNext].chunk.timestamp < us) {
+        const { chunk, meta } = audioChunks[audioNext++];
+        muxer.addAudioChunk(chunk, meta);
+      }
+    };
     check();
 
     let encodeError = null;
@@ -585,6 +643,14 @@ export async function extract(o) {
     const tracker = new Tracker(o.target, fps);
     let lastRegion = null, badMatte = 0;
 
+    // SAM 2 follows her every `samEvery` frames; the matting model draws the edges every frame.
+    let sam = samModels ? new sam2.Tracker(samModels) : null;
+    const samEvery = Math.max(1, Math.round(fps / 15));
+    const sCanvas = sam ? mk(sam2.SIZE, sam2.SIZE) : null;
+    const sCtx = sCanvas?.getContext('2d', { willReadFrequently: true });
+    const toRegion = sam ? makeSamRegion(aw, ah) : null;
+    let samRegion = null, samSeen = true, samSince = 0;
+
     const bounds = [1, 1, 0, 0];
     let thumbnail = null, found = true;
     const t0 = performance.now();
@@ -597,63 +663,101 @@ export async function extract(o) {
       const i = f.index;
       total = f.total;
 
+      if (o.stop?.requested && encoded > 0) break; // 여기까지 저장
       f.draw(aCtx, r, aw, ah);
       const px = aCtx.getImageData(0, 0, aw, ah).data;
       await breathe(); check();
-      const persons = await detect(aCanvas);
-      await breathe(); check();
-      const person = persons.length && persons[0].w === aw ? tracker.update(persons, px) : (tracker.lost++, null);
-      const others = person ? persons.filter(q => q !== person && q.w === aw && q.h === ah) : [];
-      found = !!person;
-      globalThis.__fancamDebug?.push({ i, n: persons.length, lost: tracker.lost,
-        people: persons.map(q => ({ cx: +q.cx.toFixed(3), cy: +q.cy.toFixed(3), area: +q.area.toFixed(3), me: q === person,
-          lm: q.landmarks.map(l => [+l.x.toFixed(3), +l.y.toFixed(3), +(l.visibility ?? 1).toFixed(2)]) })) });
 
-      let pha = null;
-      if (matter) {
-        try { pha = await matter.run(px); } catch (err) {
-          console.warn('GPU matting failed, continuing with the basic cut-out:', err);
-          matter = null;
+      if (sam) {
+        try {
+          if (i % samEvery === 0) {
+            f.draw(sCtx, r, sam2.SIZE, sam2.SIZE);
+            const input = sam2.toInput(sCtx.getImageData(0, 0, sam2.SIZE, sam2.SIZE).data);
+            const out = i === 0 ? await sam.start(input, ...samPrompt(o)) : await sam.next(input);
+            if (i === 0 && out.score <= 0) throw new Error('SAM 2 could not find her on the first frame');
+            samSeen = out.score > 0;
+            samRegion = samSeen ? toRegion(out.low, samEvery) : null;
+            samSince = 0;
+          } else samSince++;
+        } catch (err) {
+          if (err.name === 'AbortError') throw err;
+          console.warn('SAM 2 failed, continuing with the pose tracker:', err);
+          sam = null;
         }
       }
-      if (pha && person) {
-        // Safety net: if the GPU's matte keeps coming out empty where the pose model clearly sees
-        // her, the GPU isn't computing it right. Switch to the basic cut-out for the rest.
-        let sum = 0, cnt = 0;
-        for (let k = 0; k < n; k += 7) if (person.mask[k] > 0.8) { sum += pha[k]; cnt++; }
-        badMatte = cnt > 50 && sum / cnt < 0.2 ? badMatte + 1 : 0;
-        if (badMatte >= 8) { console.warn('GPU matte looks wrong, switching to the basic cut-out'); matter = null; pha = null; }
-      }
-      if (pha) {
-        // GPU matting for the edges, limited to her region.
-        let region = null;
-        if (person) region = lastRegion = buildRegion(person, others);
-        else if (lastRegion && tracker.lost <= fps) region = lastRegion; // briefly missed: keep her area
-        for (let k = 0; k < n; k++) {
-          const v = region ? pha[k] * region[k] : 0;
-          alpha[k] = v < 0.02 ? 0 : v;
+
+      if (sam) {
+        found = samSeen;
+        let pha = null;
+        if (matter) {
+          try { pha = await matter.run(px); } catch (err) { console.warn('GPU matting failed:', err); matter = null; }
         }
-      } else if (person) {
-        for (let k = 0, j = 0; k < n; k++, j += 4) {
-          guide[k] = (0.299 * px[j] + 0.587 * px[j + 1] + 0.114 * px[j + 2]) / 255;
-          // Where another member overlaps her, give the pixel to whoever the model is surer of.
-          let other = 0;
-          for (const q of others) if (q.mask[k] > other) other = q.mask[k];
-          raw[k] = other > person.mask[k] ? Math.max(0, person.mask[k] - other) : person.mask[k];
-        }
-        const region = buildRegion(person, others);
-        for (let k = 0; k < n; k++) raw[k] *= region[k];
-        guided(guide, raw, radius, 0.004, refined);
-        for (let k = 0; k < n; k++) {
-          // Tighten the soft ramp: the model's masks run a little wide, which shows as a halo.
-          let v = (refined[k] - 0.32) / 0.42;
-          v = v < 0 ? 0 : v > 1 ? 1 : v;
-          alpha[k] = prevAlpha ? v * 0.85 + prevAlpha[k] * 0.15 : v; // calm frame-to-frame flicker
+        if (pha && samRegion) {
+          for (let k = 0; k < n; k++) { const v = pha[k] * samRegion[k]; alpha[k] = v < 0.02 ? 0 : v; }
+        } else if (samRegion) {
+          // No matting model: snap SAM's soft mask to colour edges instead.
+          for (let k = 0, j = 0; k < n; k++, j += 4) guide[k] = (0.299 * px[j] + 0.587 * px[j + 1] + 0.114 * px[j + 2]) / 255;
+          guided(guide, samRegion.core, radius, 0.004, refined);
+          for (let k = 0; k < n; k++) { const v = (refined[k] - 0.3) / 0.4; alpha[k] = v < 0 ? 0 : v > 1 ? 1 : v; }
+        } else {
+          alpha.fill(0); // SAM says she isn't in view
         }
       } else {
-        // Missed her this frame: hold the last cut-out briefly, then fade, rather than show someone else.
-        const keep = tracker.lost <= Math.round(fps / 3) ? 1 : 0.6;
-        for (let k = 0; k < n; k++) alpha[k] = prevAlpha ? prevAlpha[k] * keep : 0;
+        const persons = await detect(aCanvas);
+        await breathe(); check();
+        const person = persons.length && persons[0].w === aw ? tracker.update(persons, px) : (tracker.lost++, null);
+        const others = person ? persons.filter(q => q !== person && q.w === aw && q.h === ah) : [];
+        found = !!person;
+        globalThis.__fancamDebug?.push({ i, n: persons.length, lost: tracker.lost,
+          people: persons.map(q => ({ cx: +q.cx.toFixed(3), cy: +q.cy.toFixed(3), area: +q.area.toFixed(3), me: q === person,
+            lm: q.landmarks.map(l => [+l.x.toFixed(3), +l.y.toFixed(3), +(l.visibility ?? 1).toFixed(2)]) })) });
+
+        let pha = null;
+        if (matter) {
+          try { pha = await matter.run(px); } catch (err) {
+            console.warn('GPU matting failed, continuing with the basic cut-out:', err);
+            matter = null;
+          }
+        }
+        if (pha && person) {
+          // Safety net: if the GPU's matte keeps coming out empty where the pose model clearly sees
+          // her, the GPU isn't computing it right. Switch to the basic cut-out for the rest.
+          let sum = 0, cnt = 0;
+          for (let k = 0; k < n; k += 7) if (person.mask[k] > 0.8) { sum += pha[k]; cnt++; }
+          badMatte = cnt > 50 && sum / cnt < 0.2 ? badMatte + 1 : 0;
+          if (badMatte >= 8) { console.warn('GPU matte looks wrong, switching to the basic cut-out'); matter = null; pha = null; }
+        }
+        if (pha) {
+          // GPU matting for the edges, limited to her region.
+          let region = null;
+          if (person) region = lastRegion = buildRegion(person, others);
+          else if (lastRegion && tracker.lost <= fps) region = lastRegion; // briefly missed: keep her area
+          for (let k = 0; k < n; k++) {
+            const v = region ? pha[k] * region[k] : 0;
+            alpha[k] = v < 0.02 ? 0 : v;
+          }
+        } else if (person) {
+          for (let k = 0, j = 0; k < n; k++, j += 4) {
+            guide[k] = (0.299 * px[j] + 0.587 * px[j + 1] + 0.114 * px[j + 2]) / 255;
+            // Where another member overlaps her, give the pixel to whoever the model is surer of.
+            let other = 0;
+            for (const q of others) if (q.mask[k] > other) other = q.mask[k];
+            raw[k] = other > person.mask[k] ? Math.max(0, person.mask[k] - other) : person.mask[k];
+          }
+          const region = buildRegion(person, others);
+          for (let k = 0; k < n; k++) raw[k] *= region[k];
+          guided(guide, raw, radius, 0.004, refined);
+          for (let k = 0; k < n; k++) {
+            // Tighten the soft ramp: the model's masks run a little wide, which shows as a halo.
+            let v = (refined[k] - 0.32) / 0.42;
+            v = v < 0 ? 0 : v > 1 ? 1 : v;
+            alpha[k] = prevAlpha ? v * 0.85 + prevAlpha[k] * 0.15 : v; // calm frame-to-frame flicker
+          }
+        } else {
+          // Missed her this frame: hold the last cut-out briefly, then fade, rather than show someone else.
+          const keep = tracker.lost <= Math.round(fps / 3) ? 1 : 0.6;
+          for (let k = 0; k < n; k++) alpha[k] = prevAlpha ? prevAlpha[k] * keep : 0;
+        }
       }
 
       // Track the overall bounding box so the player can crop empty space.
@@ -679,6 +783,7 @@ export async function extract(o) {
       const frame = new VideoFrame(out, { timestamp: Math.round(i * 1e6 / fps), duration: Math.round(1e6 / fps) });
       encoder.encode(frame, { keyFrame: i % fps === 0 });
       encoded++;
+      addAudioUntil((i + 1) * 1e6 / fps);
       frame.close();
       while (encoder.encodeQueueSize > 3) { check(); await new Promise(res => setTimeout(res, 5)); }
 
@@ -690,7 +795,7 @@ export async function extract(o) {
       const elapsed = (performance.now() - t0) / 1000;
       o.onProgress?.({
         done: i + 1, total, elapsed, eta: elapsed / (i + 1) * (total - i - 1),
-        preview: out, layout, found, matting: !!matter, decoder: source.kind,
+        preview: out, layout, found, matting: !!matter, sam: !!sam, decoder: source.kind,
       });
     }
     check();
@@ -699,6 +804,7 @@ export async function extract(o) {
     await encoder.flush();
     encoder.close();
     if (encodeError) throw encodeError;
+    addAudioUntil(encoded * 1e6 / fps);
     muxer.finalize();
 
     parts.sort((a, b) => a.position - b.position);
@@ -714,7 +820,7 @@ export async function extract(o) {
 
     return {
       blob, thumbnail, layout, crop, width: hw, height: hh, fps,
-      duration: total / fps, hasAudio, codec: enc.config.codec,
+      duration: encoded / fps, hasAudio, codec: enc.config.codec, partial: encoded < total,
     };
   } finally {
     for (const c of cleanup.reverse()) { try { c(); } catch {} }

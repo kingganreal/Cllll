@@ -11,6 +11,8 @@ const fmtTime = s => {
   s = Math.max(0, s);
   return `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
 };
+// SAM 2 tracking stays off until it has been verified on the GPU.
+const SAM_ENABLED = false;
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 
 let toastTimer;
@@ -604,7 +606,10 @@ const create = {
         throw new Error('시작 장면에서 사람을 찾지 못했어요. 시작 지점을 멤버가 잘 보이는 곳으로 옮겨 주세요.');
       }
       this.target = p.pickDefault(this.persons);
+      this.tap = null;
       this.pickApi = p;
+      // Start fetching the SAM 2 tracker now (PC with WebGPU), so it's ready when 추출 starts.
+      if (SAM_ENABLED) import('./sam2.js').then(m => m.load()).catch(() => {});
       this.drawPick();
       $('#pick-canvas').hidden = false;
       v.hidden = true;
@@ -665,6 +670,8 @@ const create = {
     const p = this.pickApi;
     const opts = {
       file: this.file, video: v, start: this.start, end: this.end, target: this.target, rect: this.rect(),
+      tap: this.tap, others: this.persons, stop: (this.stopFlag = { requested: false }),
+      useSam: SAM_ENABLED,
       fps: Number($('#fps').value), maxSide: Number($('#quality').value),
       withAudio: $('#with-audio').checked,
     };
@@ -688,7 +695,7 @@ const create = {
       if (info.stage) { $('#progress-text').textContent = info.stage + '…'; return; }
       const pct = info.done / info.total * 100;
       $('#progress-bar').style.width = pct.toFixed(1) + '%';
-      const mode = info.matting ? 'GPU 고급 누끼' : '기본 누끼';
+      const mode = info.sam ? 'SAM 2 추적 + GPU 누끼' : info.matting ? 'GPU 고급 누끼' : '기본 누끼';
       $('#progress-text').textContent =
         `${info.done} / ${info.total} 프레임 · ${pct.toFixed(0)}% · 남은 시간 약 ${fmtTime(info.eta)}\n${mode}${info.found ? '' : ' · 멤버를 놓쳐서 다시 찾는 중'}`;
       const now = performance.now();
@@ -702,10 +709,11 @@ const create = {
       const result = await p.extract(opts);
       if (runId !== this.runId) return; // cancelled meanwhile
       const clip = { id: uid(), name, created: Date.now(), ...result };
+      delete clip.partial;
       await clips.put(clip);
       requestPersistence();
       cloud.kick();
-      toast('완성! 무대에 올렸어요');
+      toast(result.partial ? `${fmtTime(result.duration)}까지 저장했어요. 무대에 올렸어요` : '완성! 무대에 올렸어요');
       this.done();
       await stage.addAndOpen(clip.id);
     } catch (err) {
@@ -719,6 +727,15 @@ const create = {
     }
   },
 
+  // Finish early: stop at the next frame and save what's done so far as a clip.
+  stopAndSave() {
+    if (!this.busy || !this.stopFlag) return;
+    this.stopFlag.requested = true;
+    const b = $('#btn-stop');
+    b.disabled = true;
+    b.textContent = '저장하는 중…';
+  },
+
   // Stop right away: reset the screen now; the work still in flight notices the abort and quits.
   cancel() {
     if (!this.busy) return;
@@ -730,6 +747,8 @@ const create = {
 
   done() {
     this.busy = false;
+    $('#btn-stop').disabled = false;
+    $('#btn-stop').textContent = '여기까지 저장';
     keepAwake(false);
     $('#step-progress').hidden = true;
     $('#step-edit').hidden = false;
@@ -776,6 +795,7 @@ $('#pick-canvas').addEventListener('click', e => {
   const c = e.currentTarget, r = c.getBoundingClientRect();
   const nx = (e.clientX - r.left) / r.width, ny = (e.clientY - r.top) / r.height;
   create.target = create.pickApi.pickAt(create.persons, nx, ny);
+  create.tap = [nx, ny];
   create.drawPick();
 });
 $('#btn-start').addEventListener('click', () => create.run());
@@ -783,6 +803,7 @@ $('#auto-crop').addEventListener('change', () => create.reset());
 // The pick is analysed at a size that depends on quality, so re-pick after changing it.
 $('#quality').addEventListener('change', () => { if (create.persons) create.reset(); });
 $('#btn-cancel').addEventListener('click', () => create.cancel());
+$('#btn-stop').addEventListener('click', () => create.stopAndSave());
 
 // ---------------------------------------------------------------------------
 // YouTube: the browser can't download from YouTube, so we record it while it plays.
