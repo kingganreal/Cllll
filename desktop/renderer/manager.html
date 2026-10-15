@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self' file:; img-src 'self' file: data:; style-src 'self' 'unsafe-inline'">
+<title>직캠 스테이지</title>
+<style>
+  /* Same backstage palette as the web app. */
+  :root {
+    --ink: #110f18; --panel: #1b1825; --line: #2e2a3b; --text: #efeaf6; --muted: #9a93ab;
+    --accent: #ff9fb6; --accent-ink: #2a0f18; --cool: #9fd3ff; --danger: #ff7a7a;
+    --checker-a: #2a2636; --checker-b: #221f2d;
+    --body: "Malgun Gothic", "Apple SD Gothic Neo", system-ui, sans-serif;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--ink); color: var(--text); font: 14px/1.55 var(--body); }
+  header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 14px 18px; border-bottom: 1px solid var(--line); }
+  h1 { margin: 0; font-size: 20px; flex: 1; }
+  h1::after { content: ""; display: inline-block; width: .4em; height: .4em; margin-left: .25em; border-radius: 50%; background: var(--accent); box-shadow: 0 0 10px var(--accent); }
+  main { padding: 18px; display: grid; gap: 16px; max-width: 1000px; }
+  .btn { border: 1px solid var(--line); background: var(--panel); color: var(--text); border-radius: 999px; padding: 7px 14px; cursor: pointer; font: inherit; }
+  .btn:hover { border-color: var(--muted); }
+  .btn.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
+  .btn.danger { color: var(--danger); background: transparent; }
+  .btn.small { padding: 4px 10px; font-size: 13px; }
+  .note { margin: 0; padding: 12px 14px; border-radius: 12px; background: var(--panel); border: 1px solid var(--line); color: var(--muted); }
+  .note b { color: var(--text); }
+  .grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); }
+  .card { border-radius: 14px; overflow: hidden; background: var(--panel); border: 1px solid var(--line); display: grid; grid-template-rows: auto 1fr; }
+  .thumb { aspect-ratio: 3 / 4; display: grid; place-items: center; overflow: hidden; min-height: 0;
+    background-color: var(--checker-a);
+    background-image: linear-gradient(45deg, var(--checker-b) 25%, transparent 25%, transparent 75%, var(--checker-b) 75%),
+                      linear-gradient(45deg, var(--checker-b) 25%, transparent 25%, transparent 75%, var(--checker-b) 75%);
+    background-size: 16px 16px; background-position: 0 0, 8px 8px; }
+  .thumb img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  .body { padding: 10px 12px 12px; display: grid; gap: 8px; }
+  .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .meta { font-size: 12px; color: var(--muted); }
+  .actions { display: flex; gap: 6px; flex-wrap: wrap; }
+  .empty { color: var(--muted); }
+  .empty ol { padding-left: 1.3em; display: grid; gap: 6px; }
+  .empty b { color: var(--text); }
+  label.check { display: flex; gap: 8px; align-items: center; cursor: pointer; color: var(--muted); }
+  label.check input { accent-color: var(--accent); width: 16px; height: 16px; }
+  footer { display: flex; gap: 16px; flex-wrap: wrap; align-items: center; padding: 0 18px 18px; color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>직캠 스테이지</h1>
+  <button id="toggle-hidden" class="btn" type="button">캐릭터 모두 숨기기</button>
+  <button id="open-web" class="btn primary" type="button">웹앱에서 클립 만들기</button>
+</header>
+<main>
+  <p class="note"><b>바탕화면에 띄우는 법</b> 크롬에서 웹앱을 열고, 클립의 <b>바탕화면에</b> 버튼을 누르면 여기로 와서 바로 떠요.
+    캐릭터는 끌어서 옮기고, 마우스 휠로 크기를 바꾸고, <b>오른쪽 클릭</b>으로 반전·소리·속도·투명도를 바꿀 수 있어요.
+    웹앱의 유튜브 원본 받기도 이 앱이 켜져 있으면 바로 돼요.</p>
+  <div id="grid" class="grid"></div>
+  <div id="empty" class="empty" hidden>
+    <ol>
+      <li><b>웹앱 열기</b> 위의 "웹앱에서 클립 만들기"를 눌러 크롬에서 여세요.</li>
+      <li><b>클립 만들기</b> 직캠이나 유튜브 링크로 클립을 만들어요. 다른 기기에서 만든 클립은 구글 드라이브 동기화로 들어와요.</li>
+      <li><b>바탕화면에</b> 클립의 "바탕화면에" 버튼을 누르면 이 PC 바탕화면에 떠요.</li>
+    </ol>
+  </div>
+</main>
+<footer>
+  <label class="check"><input id="auto-start" type="checkbox"> 윈도우를 켜면 자동으로 실행</label>
+  <span id="version"></span>
+</footer>
+<script src="manager.js"></script>
+</body>
+</html>

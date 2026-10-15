@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>직캠 스테이지</title>
+<meta name="description" content="직캠 영상에서 한 멤버만 따내서 화면에 띄워 두는 앱">
+<meta name="theme-color" content="#110f18">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Do+Hyeon&family=IBM+Plex+Sans+KR:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+<div id="app">
+
+  <!-- 보관함 -->
+  <section id="view-library" class="view" hidden>
+    <header class="topbar">
+      <h1 class="brand">직캠 스테이지</h1>
+      <div class="row">
+        <button id="btn-sync" class="btn ghost" type="button">기기 동기화</button>
+        <button id="btn-import" class="btn ghost" type="button">파일 가져오기</button>
+        <button id="btn-open-stage" class="btn ghost" type="button">무대 열기</button>
+      </div>
+    </header>
+    <div class="page">
+      <button id="btn-new" class="newclip" type="button">
+        <span class="newclip-plus" aria-hidden="true">+</span>
+        <span>
+          <strong>직캠 영상에서 만들기</strong>
+          <small>영상을 고르고 멤버를 탭하면, 그 사람만 배경 없이 따내요</small>
+        </span>
+      </button>
+      <p id="support-warning" class="notice" hidden></p>
+      <p id="sync-status" class="sync-status" hidden></p>
+
+      <section id="sync-panel" class="sync" hidden aria-labelledby="sync-title">
+        <div class="sync-head">
+          <h2 id="sync-title" class="section-title">구글 드라이브 동기화</h2>
+          <button id="sync-close" class="btn ghost small" type="button">닫기</button>
+        </div>
+
+        <div id="drive-setup" hidden>
+          <p class="hint">폰, 패드, 컴퓨터가 같은 클립을 보도록 내 구글 드라이브의 "직캠 스테이지" 폴더에 클립을 올려 둬요.
+            앱은 자기가 만든 파일만 볼 수 있어요. 처음 한 번, 구글에 이 앱을 등록해야 해요 (10분 정도).</p>
+          <ol class="steps">
+            <li><b>프로젝트 만들기</b> <a href="https://console.cloud.google.com/projectcreate" target="_blank" rel="noopener">구글 클라우드 콘솔</a>에서 프로젝트 이름을 <code>fancam-stage</code>로 정하고 만들기.</li>
+            <li><b>드라이브 API 켜기</b> <a href="https://console.cloud.google.com/apis/library/drive.googleapis.com" target="_blank" rel="noopener">Google Drive API</a>에서 <b>사용</b>을 누르세요.</li>
+            <li><b>앱 정보 등록</b> <a href="https://console.cloud.google.com/auth/overview" target="_blank" rel="noopener">Google 인증 플랫폼</a>에서 시작하기 → 앱 이름 <code>직캠 스테이지</code>, 지원 이메일은 내 메일, 대상은 <b>외부</b>, 연락처 이메일 입력 → 만들기.</li>
+            <li><b>나를 테스트 사용자로 추가</b> 왼쪽 메뉴 <b>대상</b> → 테스트 사용자 → Add users → 내 지메일 주소.</li>
+            <li><b>클라이언트 만들기</b> 왼쪽 메뉴 <b>클라이언트</b> → 클라이언트 만들기 → 유형 <b>웹 애플리케이션</b> →
+              <b>승인된 자바스크립트 원본</b>에 아래 주소 추가 → 만들기.
+              <span class="origin-row"><code id="drive-origin"></code> <button id="drive-origin-copy" class="btn small" type="button">복사</button></span></li>
+            <li><b>클라이언트 ID 붙여 넣기</b> 만들어진 <code>…apps.googleusercontent.com</code>로 끝나는 ID를 아래에 넣으세요.</li>
+          </ol>
+          <form id="drive-form" class="sync-form">
+            <label class="label" for="drive-client">클라이언트 ID</label>
+            <input id="drive-client" type="text" placeholder="1234…-abcd.apps.googleusercontent.com" autocomplete="off" autocapitalize="off" spellcheck="false">
+            <button class="btn primary" type="submit">저장하고 구글로 로그인</button>
+          </form>
+        </div>
+
+        <div id="drive-signin" hidden>
+          <p class="hint">구글로 로그인하면 이 기기의 클립이 드라이브에 올라가고, 다른 기기에서 만든 클립을 받아 와요.
+            처음 로그인할 때 "Google에서 확인하지 않은 앱" 화면이 나오면 <b>계속</b>을 누르고, 드라이브 접근 체크 상자를 켜 주세요.</p>
+          <div class="row">
+            <button id="drive-login" class="btn primary" type="button">구글로 로그인</button>
+            <button id="drive-reset" class="btn ghost small" type="button">클라이언트 ID 다시 넣기</button>
+          </div>
+        </div>
+
+        <div id="drive-connected" hidden>
+          <p><span class="ok-dot" aria-hidden="true"></span>구글 드라이브의 <b>직캠 스테이지</b> 폴더와 동기화하고 있어요.
+            클립을 만들거나 이름을 바꾸거나 지우면 다른 기기에도 반영돼요.</p>
+          <div class="row">
+            <button id="sync-now" class="btn primary" type="button">지금 동기화</button>
+            <button id="sync-link" class="btn ghost" type="button">다른 기기 연결 링크 복사</button>
+            <button id="sync-off" class="btn ghost danger" type="button">이 기기 연결 끊기</button>
+          </div>
+          <input id="sync-link-text" type="text" readonly hidden aria-label="연결 링크">
+          <p class="hint">다른 기기에서는 이 앱을 열고 "기기 동기화" → 구글로 로그인만 하면 돼요. 클라이언트 ID를 다시 넣기 귀찮으면 연결 링크를 보내서 여세요.
+            지운 클립은 드라이브 휴지통으로 가서 30일 동안 되살릴 수 있어요.
+            구글은 보안상 한 시간쯤 지나면 로그인을 다시 확인해요. 그때는 위에 뜨는 버튼을 한 번 눌러 주세요.</p>
+        </div>
+      </section>
+      <h2 class="section-title">내 클립 <span id="clip-count" class="count"></span></h2>
+      <div id="clip-grid" class="grid"></div>
+      <div id="empty-library" class="empty" hidden>
+        <ol>
+          <li><b>직캠 영상 고르기</b> 갤러리나 파일에서 영상을 불러와요. 영상은 기기 밖으로 나가지 않아요.</li>
+          <li><b>멤버 탭하기</b> 첫 장면에서 따낼 멤버를 고르면 끝까지 따라가며 누끼를 따요.</li>
+          <li><b>무대에 띄우기</b> 끌어서 옮기고, 두 손가락으로 크기를 바꾸고, 전체화면으로 띄워 두세요.</li>
+        </ol>
+      </div>
+    </div>
+  </section>
+
+  <!-- 만들기 -->
+  <section id="view-create" class="view" hidden>
+    <header class="topbar">
+      <button class="btn ghost" type="button" data-nav="library">← 보관함</button>
+      <h1 class="topbar-title">새 클립 만들기</h1>
+      <span class="spacer"></span>
+    </header>
+    <div class="page create">
+      <!-- 1. 파일 -->
+      <label id="drop" class="drop" for="file-input">
+        <input id="file-input" type="file" accept="video/*,.mp4,.mov,.webm,.mkv">
+        <strong>직캠 영상 고르기</strong>
+        <small>MP4 · MOV · WebM. 세로 직캠이 가장 잘 돼요.</small>
+      </label>
+
+      <section id="yt" class="yt" aria-labelledby="yt-title">
+        <h2 id="yt-title" class="label">유튜브 링크로 가져오기</h2>
+        <form id="yt-form" class="yt-row">
+          <input id="yt-url" type="text" inputmode="url" autocomplete="off" placeholder="youtube.com/shorts/… 또는 youtu.be/… 붙여넣기">
+          <button class="btn" type="submit">가져오기</button>
+        </form>
+        <div id="yt-help" class="yt-help" hidden></div>
+      </section>
+
+      <section id="faces" class="yt faces" aria-labelledby="faces-title">
+        <h2 id="faces-title" class="label">설윤 얼굴 사진 <span id="faces-count" class="faces-count"></span></h2>
+        <p class="hint">정면 얼굴이 잘 보이는 설윤 사진을 3~5장 넣어 두면, 얼굴로 설윤을 찾아서 다른 멤버로 넘어가지 않게 해요. 한 번만 넣으면 다른 기기에도 공유돼요.</p>
+        <div class="faces-row">
+          <div id="faces-list" class="faces-list"></div>
+          <label id="faces-add" class="btn" for="faces-input">+ 사진 추가</label>
+          <input id="faces-input" type="file" accept="image/*" multiple hidden>
+        </div>
+      </section>
+
+      <div id="step-edit" class="create-grid" hidden>
+        <div class="media">
+          <div class="media-frame">
+            <video id="src-video" playsinline webkit-playsinline muted preload="auto"></video>
+            <canvas id="pick-canvas" hidden></canvas>
+          </div>
+          <p id="pick-hint" class="hint" hidden>따낼 멤버를 탭하세요. 분홍색으로 표시된 사람만 남아요.</p>
+        </div>
+
+        <div class="panel">
+          <div class="field">
+            <span class="label">구간</span>
+            <div class="trim">
+              <div class="trim-row">
+                <span>시작 <output id="start-out" class="mono">0:00</output></span>
+                <button id="set-start" class="btn small" type="button">현재 위치로</button>
+              </div>
+              <div class="trim-row">
+                <span>끝 <output id="end-out" class="mono">0:00</output></span>
+                <button id="set-end" class="btn small" type="button">현재 위치로</button>
+              </div>
+              <input id="scrub" type="range" min="0" max="1" step="0.01" value="0" aria-label="영상 위치">
+              <div class="trim-row muted">
+                <span>현재 <output id="now-out" class="mono">0:00</output></span>
+                <span>길이 <output id="len-out" class="mono">0:00</output></span>
+              </div>
+            </div>
+          </div>
+
+          <div class="field">
+            <label class="label" for="clip-name">이름</label>
+            <input id="clip-name" type="text" value="설윤" maxlength="40">
+          </div>
+
+          <div class="field two">
+            <div>
+              <label class="label" for="quality">화질</label>
+              <select id="quality">
+                <option value="720">보통 (빠름)</option>
+                <option value="960" selected>고화질</option>
+                <option value="1280">최고 (느림)</option>
+                <option value="1920">FHD · 4K 원본용 (PC 권장, 아주 느림)</option>
+              </select>
+            </div>
+            <div>
+              <label class="label" for="fps">프레임</label>
+              <select id="fps">
+                <option value="24">24fps (빠름)</option>
+                <option value="30" selected>30fps</option>
+                <option value="60">60fps (느림)</option>
+              </select>
+            </div>
+          </div>
+
+          <label class="check"><input id="with-audio" type="checkbox" checked> 노래 소리도 같이 저장</label>
+          <label id="crop-row" class="check" hidden><input id="auto-crop" type="checkbox" checked> <span id="crop-label">검은 테두리 잘라내기</span></label>
+
+          <button id="btn-pick" class="btn primary wide" type="button">멤버 고르기</button>
+          <button id="btn-start" class="btn primary wide" type="button" hidden>이 멤버로 추출 시작</button>
+          <p id="create-error" class="error" hidden></p>
+        </div>
+      </div>
+
+      <div id="step-progress" class="progress-wrap" hidden>
+        <canvas id="progress-canvas"></canvas>
+        <div class="progress-info">
+          <div class="bar"><span id="progress-bar"></span></div>
+          <p id="progress-text" class="mono">준비 중…</p>
+          <p class="hint">처리하는 동안 화면을 켜 두고 이 화면에 머물러 주세요. 왼쪽은 색, 오른쪽은 투명도예요.</p>
+          <div class="row">
+            <button id="btn-stop" class="btn primary" type="button">여기까지 저장</button>
+            <button id="btn-cancel" class="btn ghost" type="button">취소</button>
+          </div>
+          <p class="hint">"여기까지 저장"을 누르면 지금까지 처리한 부분만 클립으로 저장해요. "취소"는 모두 버려요.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 무대 -->
+  <section id="view-stage" class="view stage-view" hidden>
+    <div id="stage" class="stage">
+      <div id="stage-empty" class="stage-empty" hidden>
+        <p>무대가 비어 있어요.</p>
+        <button class="btn primary" type="button" data-action="add">클립 올리기</button>
+      </div>
+    </div>
+
+    <header id="stage-bar" class="stage-bar">
+      <button class="btn ghost" type="button" data-nav="library">← 보관함</button>
+      <span class="spacer"></span>
+      <button class="btn ghost" type="button" data-action="add">+ 클립</button>
+      <button class="btn ghost" type="button" data-action="arrange">나란히</button>
+      <button class="btn ghost" type="button" data-action="bg">배경</button>
+      <button class="btn ghost" type="button" data-action="play" id="btn-play">일시정지</button>
+      <button class="btn ghost" type="button" data-action="pip" id="btn-pip" hidden>항상 위에</button>
+      <button class="btn ghost" type="button" data-action="fullscreen" id="btn-fs">전체화면</button>
+    </header>
+
+    <div id="sprite-bar" class="sprite-bar" hidden>
+      <button class="btn ghost" type="button" data-sprite="flip">좌우 반전</button>
+      <label class="inline">속도
+        <select id="sprite-speed">
+          <option value="0.5">0.5×</option>
+          <option value="0.75">0.75×</option>
+          <option value="1" selected>1×</option>
+          <option value="1.25">1.25×</option>
+          <option value="1.5">1.5×</option>
+        </select>
+      </label>
+      <button class="btn ghost" type="button" data-sprite="sound" id="sprite-sound">소리 켜기</button>
+      <button class="btn ghost" type="button" data-sprite="desktop" hidden>바탕화면에</button>
+      <button class="btn ghost" type="button" data-sprite="front">맨 앞으로</button>
+      <button class="btn ghost danger" type="button" data-sprite="remove">내리기</button>
+    </div>
+
+    <div id="sheet" class="sheet" hidden>
+      <div class="sheet-head">
+        <h2 id="sheet-title">클립 올리기</h2>
+        <button class="btn ghost" type="button" data-action="close-sheet">닫기</button>
+      </div>
+      <div id="sheet-body" class="sheet-body"></div>
+    </div>
+  </section>
+
+  <input id="import-input" type="file" accept="video/mp4" multiple hidden>
+  <input id="bg-input" type="file" accept="image/*" hidden>
+  <div id="toast" class="toast" role="status" hidden></div>
+</div>
+<script type="module" src="js/app.js"></script>
+</body>
+</html>

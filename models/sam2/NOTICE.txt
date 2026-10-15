@@ -1,0 +1,3 @@
+SAM 2.1 (hiera-tiny) — Meta AI, Apache License 2.0: https://github.com/facebookresearch/sam2
+ONNX export and video predictor reference: axinc-ai/ailia-models (MIT): https://github.com/axinc-ai/ailia-models/tree/master/image_segmentation/segment-anything-2
+Changes here: simplified with onnxsim (so onnxruntime-web accepts the graph) and weights stored as float16 with a Cast back to float32 at load.

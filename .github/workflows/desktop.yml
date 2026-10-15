@@ -1,0 +1,44 @@
+name: Build Windows app
+
+on:
+  push:
+    branches: [main, claude/seol-yoon-fancam-extractor-9tnmnx]
+    paths: ['desktop/**', 'js/player.js', 'icons/**', '.github/workflows/desktop.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install
+        working-directory: desktop
+        run: npm install --no-audit --no-fund
+      - name: Build installer
+        working-directory: desktop
+        run: npm run dist
+      - name: Read version
+        id: v
+        shell: bash
+        run: echo "version=$(node -p "require('./desktop/package.json').version")" >> "$GITHUB_OUTPUT"
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: desktop-v${{ steps.v.outputs.version }}
+          name: 직캠 스테이지 윈도우 앱 ${{ steps.v.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          make_latest: true
+          files: desktop/dist/FancamStage-Setup-*.exe
+          body: |
+            **FancamStage-Setup-${{ steps.v.outputs.version }}.exe**를 받아서 실행하세요.
+            "Windows의 PC 보호" 창이 뜨면 추가 정보 → 실행을 누르면 돼요 (서명하지 않은 개인용 앱이라 떠요).
+
+            - 웹앱에서 클립의 "바탕화면에"를 누르면 바탕화면에 배경 없이 떠요.
+            - 끌어서 옮기기, 마우스 휠로 크기, 오른쪽 클릭으로 반전·소리·속도·투명도·항상 위에.
+            - 웹앱의 유튜브 원본(최대 4K) 받기도 이 앱이 해요.

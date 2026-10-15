@@ -1,0 +1,36 @@
+{
+  "name": "fancam-stage-desktop",
+  "productName": "FancamStage",
+  "version": "0.1.0",
+  "description": "직캠 스테이지 윈도우 앱: 클립을 바탕화면에 띄우고, 유튜브 원본을 받아요",
+  "main": "main.js",
+  "author": "kingganreal",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "shared": "node scripts/copy-shared.js",
+    "start": "npm run shared && electron .",
+    "dist": "npm run shared && electron-builder --win --publish never"
+  },
+  "devDependencies": {
+    "electron": "44.4.5",
+    "electron-builder": "26.16.1"
+  },
+  "build": {
+    "appId": "io.github.kingganreal.fancamstage",
+    "productName": "FancamStage",
+    "directories": { "output": "dist" },
+    "files": ["main.js", "preload.js", "server.js", "ytdlp.js", "store.js", "config.js", "renderer/**", "assets/**"],
+    "win": {
+      "target": [{ "target": "nsis", "arch": ["x64"] }],
+      "icon": "assets/icon.png"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "artifactName": "FancamStage-Setup-${version}.${ext}",
+      "shortcutName": "직캠 스테이지",
+      "uninstallDisplayName": "직캠 스테이지"
+    }
+  }
+}

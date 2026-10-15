@@ -1,0 +1,4 @@
+node_modules/
+dist/
+renderer/player.js
+assets/icon.png
