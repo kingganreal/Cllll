@@ -669,22 +669,27 @@ export async function extract(o) {
   }
   const off = what => err => { console.warn(what + ' off:', err); return null; };
   // Loading deadlines: generous (creating sessions takes a while); SAM 2 also downloads ~100 MB once.
-  const LOAD = 120000, SAM_LOAD = 600000;
+  const LOAD = 180000, SAM_LOAD = 600000;
   // The matting model in the worker (whichever worker is current).
   const workerMatter = () => ({
     run(px) { const copy = px.slice(); return gpu.call('matte', [copy], { timeout: 20000, transfer: [copy.buffer] }); },
   });
-  let [source, matter, samModels, faceModels] = await Promise.all([
+  // One after another, each with its own deadline: in the worker they'd queue behind each other
+  // anyway, and a deadline shouldn't count the time spent waiting for the others.
+  const loadGpuModels = async () => {
+    const m = o.useMatting === false ? null
+      : await gpu.call('mattingCreate', [aw, ah], { timeout: LOAD }).then(workerMatter).catch(off('matting'));
+    const samOk = o.useSam !== false && !gpu.dead && await gpu.call('samLoad', [], { timeout: SAM_LOAD }).then(() => true, off('SAM 2'));
+    const faceOk = !!o.faceRef && !gpu.dead && await gpu.call('faceLoad', [], { timeout: LOAD }).then(() => true, () => false);
+    return [m, samOk, faceOk];
+  };
+  let [source, [matter, samOk, faceOk]] = await Promise.all([
     openSource(o.file, video),
-    gpu && o.useMatting !== false
-      ? gpu.call('mattingCreate', [aw, ah], { timeout: LOAD }).then(workerMatter).catch(off('matting'))
-      : null,
-    gpu && o.useSam !== false ? gpu.call('samLoad', [], { timeout: SAM_LOAD }).then(() => gpu).catch(off('SAM 2')) : null,
-    o.faceRef
-      ? (gpu ? gpu.call('faceLoad', [], { timeout: LOAD }).then(() => ({ gpu })) : Promise.reject(new Error('no GPU')))
-        .catch(() => face.load().then(local => ({ local }))).catch(off('face check'))
-      : null,
+    gpu ? loadGpuModels() : [null, false, false],
   ]);
+  let samModels = samOk ? gpu : null;
+  let faceModels = !o.faceRef ? null
+    : faceOk ? { gpu } : await face.load().then(local => ({ local })).catch(off('face check'));
   const cleanup = [() => source.close()];
   try {
     check();
@@ -812,15 +817,11 @@ export async function extract(o) {
       gpu = gpuWorker();
       configure();
       matter = null;
-      gpuRestarting = Promise.all([
-        o.useMatting === false ? null : gpu.call('mattingCreate', [aw, ah], { timeout: LOAD }).then(workerMatter).catch(off('matting')),
-        o.useSam === false ? false : gpu.call('samLoad', [], { timeout: SAM_LOAD }).then(() => true, off('SAM 2')),
-        faceModels?.gpu ? gpu.call('faceLoad', [], { timeout: LOAD }).then(() => true, () => false) : false,
-      ]).then(([m, samOk, faceOk]) => {
+      gpuRestarting = loadGpuModels().then(([m, samBack, faceBack]) => {
         matter = m;
-        samRestart = !!samOk;
-        if (faceOk) faceModels = { ...faceModels, gpu };
-        globalThis.__fancamDebug?.push({ restarted: gpuRestarts, matting: !!m, sam: !!samOk, face: !!faceOk });
+        samRestart = !!samBack;
+        if (faceBack && faceModels) faceModels = { ...faceModels, gpu };
+        globalThis.__fancamDebug?.push({ restarted: gpuRestarts, matting: !!m, sam: !!samBack, face: !!faceBack });
       }).finally(() => { gpuRestarting = null; });
     };
     if (gpu?.dead) restartGpu(new Error(gpu.dead)); // stopped while loading: try a fresh worker
