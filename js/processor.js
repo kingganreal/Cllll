@@ -4,6 +4,10 @@
 // the halves into a transparent image with a tiny WebGL shader.
 import { PoseLandmarker } from '../vendor/mediapipe/vision_bundle.mjs';
 import { Muxer, StreamTarget } from '../vendor/mp4-muxer/mp4-muxer.mjs';
+import { openSource, seekVideo } from './source.js';
+import * as matting from './matting.js';
+
+export { seekVideo as seek };
 
 // Longest side of the frame fed to the segmentation model. Full-HD output gets a finer
 // matte so edges stay crisp after upscaling.
@@ -15,7 +19,6 @@ const GRID = 4;            // stride for the coarse masks used to track a person
 
 let landmarkerPromise = null;
 let delegate = 'GPU';
-let lastTimestamp = 0;
 
 export function getLandmarker() {
   landmarkerPromise ??= (async () => {
@@ -29,7 +32,10 @@ export function getLandmarker() {
         modelAssetPath: new URL('../models/pose_landmarker_full.task', import.meta.url).href,
         delegate,
       },
-      runningMode: 'VIDEO',
+      // IMAGE mode looks for everyone in every frame. VIDEO mode only keeps following the
+      // person it already has and never notices a second one, so it can slide onto another
+      // member when two cross. Tracker below does the following instead.
+      runningMode: 'IMAGE',
       numPoses: 5,
       outputSegmentationMasks: true,
       minPoseDetectionConfidence: 0.35,
@@ -62,16 +68,10 @@ export async function detect(source) {
   return persons;
 }
 
-// VIDEO mode needs strictly increasing timestamps across every call.
-function nextTimestamp() {
-  lastTimestamp = Math.max(lastTimestamp + 1, Math.round(performance.now()));
-  return lastTimestamp;
-}
-
 // Runs the model on `source` and returns every person found, each with its own mask.
 function detectPersons(landmarker, source) {
   const persons = [];
-  landmarker.detectForVideo(source, nextTimestamp(), result => {
+  landmarker.detect(source, result => {
     const masks = result.segmentationMasks || [];
     result.landmarks.forEach((landmarks, i) => {
       const m = masks[i];
@@ -142,22 +142,162 @@ export function pickDefault(persons) {
   return best;
 }
 
-// Follows the chosen person from one frame to the next.
-function track(persons, prev) {
-  let best = null, bestScore = 0.12;
-  for (const p of persons) {
-    const s = iou(p, prev);
-    if (s > bestScore) { bestScore = s; best = p; }
+// ---------------------------------------------------------------------------
+// Following her through the video.
+// Each candidate is scored on: overlap with where she was, her clothing colours, where she should
+// be given her recent motion, closeness to the centre (fancams keep her centred), and size.
+
+const HIST_BINS = 12 * 3 + 4;
+
+// Colour histogram of a person's pixels (hue x saturation for colours, 4 grey levels otherwise).
+function colourHist(p, rgba) {
+  const h = new Float32Array(HIST_BINS);
+  const gw = Math.ceil(p.w / GRID);
+  let n = 0;
+  for (let i = 0; i < p.grid.length; i++) {
+    if (!p.grid[i]) continue;
+    const x = (i % gw) * GRID, y = Math.floor(i / gw) * GRID;
+    const j = (y * p.w + x) * 4;
+    const r = rgba[j] / 255, g = rgba[j + 1] / 255, b = rgba[j + 2] / 255;
+    const max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
+    const sat = max ? d / max : 0;
+    if (sat > 0.22 && max > 0.18) {
+      let hue = max === r ? ((g - b) / d) % 6 : max === g ? (b - r) / d + 2 : (r - g) / d + 4;
+      hue = (hue + 6) % 6 / 6;
+      h[Math.min(11, Math.floor(hue * 12)) * 3 + Math.min(2, Math.floor((sat - 0.22) / 0.26))]++;
+    } else {
+      h[36 + Math.min(3, Math.floor(max * 4))]++;
+    }
+    n++;
   }
-  if (best) return best;
-  // Fast moves can break overlap: fall back to a nearby person of similar size.
-  let bestDist = 0.18;
-  for (const p of persons) {
-    const d = Math.hypot(p.cx - prev.cx, p.cy - prev.cy);
-    const sizeRatio = p.area / Math.max(prev.area, 1e-6);
-    if (d < bestDist && sizeRatio > 0.4 && sizeRatio < 2.5) { bestDist = d; best = p; }
+  if (n) for (let k = 0; k < HIST_BINS; k++) h[k] /= n;
+  return n > 20 ? h : null;
+}
+
+function histSimilarity(a, b) {
+  if (!a || !b) return 0.5;
+  let s = 0;
+  for (let k = 0; k < HIST_BINS; k++) s += Math.sqrt(a[k] * b[k]);
+  return s; // Bhattacharyya coefficient, 1 = identical
+}
+
+class Tracker {
+  constructor(target, fps) {
+    this.last = target;      // last confident detection
+    this.ref = null;         // her colour histogram, learnt from the first frames
+    this.vx = 0; this.vy = 0;
+    this.lost = 0;
+    this.fps = fps;
   }
-  return best;
+
+  update(persons, rgba) {
+    const last = this.last;
+    const lostLong = this.lost > this.fps; // over a second: look again everywhere
+    const px = last.cx + this.vx * Math.min(this.lost + 1, 10), py = last.cy + this.vy * Math.min(this.lost + 1, 10);
+    let best = null, bestScore = -Infinity, second = -Infinity, bestParts = null;
+    for (const p of persons) {
+      if (!p.area) continue;
+      const hist = colourHist(p, rgba);
+      p.hist = hist;
+      const overlap = lostLong ? 0 : iou(p, last);
+      const looks = histSimilarity(hist, this.ref);
+      const motion = Math.max(0, 1 - Math.hypot(p.cx - px, p.cy - py) / 0.25);
+      const centre = Math.max(0, 1 - Math.hypot(p.cx - 0.5, p.cy - 0.5) / 0.5);
+      const size = Math.max(0, 1 - Math.abs(Math.log(p.area / Math.max(last.area, 1e-4))) / Math.log(3));
+      const score = lostLong
+        ? 1.6 * looks + 1.0 * centre + 0.5 * size
+        : 1.8 * overlap + 1.2 * looks + 0.8 * motion + 0.5 * centre + 0.4 * size;
+      if (score > bestScore) { second = bestScore; bestScore = score; best = p; bestParts = { overlap, looks, motion }; }
+      else if (score > second) second = score;
+    }
+    const ok = best && (lostLong
+      ? bestParts.looks > 0.62 && bestScore > 1.6
+      : (bestParts.overlap > 0.2 || (bestParts.looks > 0.6 && bestParts.motion > 0.3)) && bestScore > 1.2);
+    if (!ok) { this.lost++; return null; }
+
+    // Learn how she moves and what she wears (slowly, and only when sure it's her).
+    const dx = best.cx - last.cx, dy = best.cy - last.cy, steps = this.lost + 1;
+    this.vx = this.vx * 0.6 + (dx / steps) * 0.4;
+    this.vy = this.vy * 0.6 + (dy / steps) * 0.4;
+    if (best.hist && (bestParts.overlap > 0.4 || !this.ref)) {
+      if (!this.ref) this.ref = best.hist.slice();
+      else for (let k = 0; k < HIST_BINS; k++) this.ref[k] = this.ref[k] * 0.97 + best.hist[k] * 0.03;
+    }
+    this.last = best;
+    this.lost = 0;
+    return best;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Her region. When two people overlap the model often returns one merged outline for both,
+// but its skeleton (joint positions) still belongs to one person. So her region is the
+// outline limited to a zone around her skeleton, minus anyone else, softened a little.
+
+const LIMBS = [[11, 13], [13, 15], [12, 14], [14, 16], [11, 23], [12, 24],
+  [23, 25], [25, 27], [24, 26], [26, 28], [27, 31], [28, 32], [15, 19], [16, 20], [27, 29], [28, 30]];
+
+function makeRegionBuilder(w, h) {
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  const n = w * h;
+  const skel = new Float32Array(n), zone = new Float32Array(n), tmp = new Float32Array(n), out = new Float32Array(n);
+
+  return (target, others) => {
+    const lm = target.landmarks || [];
+    const ok = i => lm[i] && (lm[i].visibility ?? 1) > 0.2;
+    const pt = i => [lm[i].x * w, lm[i].y * h];
+    const vis = lm.filter((l, i) => ok(i));
+    if (vis.length < 6) return target.mask.slice(); // too little skeleton to go on
+    const ys = vis.map(l => l.y * h);
+    const bodyH = Math.max(h * 0.15, Math.max(...ys) - Math.min(...ys));
+
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, w, h);
+    ctx.strokeStyle = ctx.fillStyle = '#fff';
+    ctx.lineCap = ctx.lineJoin = 'round';
+    ctx.lineWidth = Math.max(4, bodyH * 0.11);
+    ctx.beginPath();
+    for (const [a, b] of LIMBS) {
+      if (!ok(a) || !ok(b)) continue;
+      ctx.moveTo(...pt(a)); ctx.lineTo(...pt(b));
+    }
+    ctx.stroke();
+    if ([11, 12, 24, 23].every(ok)) { // torso
+      ctx.beginPath();
+      [11, 12, 24, 23].forEach((i, k) => (k ? ctx.lineTo(...pt(i)) : ctx.moveTo(...pt(i))));
+      ctx.closePath(); ctx.fill(); ctx.stroke();
+    }
+    const head = [0, 7, 8].filter(ok);
+    if (head.length) { // head and hair
+      const hx = head.reduce((s, i) => s + lm[i].x, 0) / head.length * w;
+      const hy = head.reduce((s, i) => s + lm[i].y, 0) / head.length * h;
+      ctx.beginPath(); ctx.arc(hx, hy, bodyH * 0.13, 0, Math.PI * 2); ctx.fill();
+      if (ok(11) && ok(12)) { // neck
+        const [sx, sy] = [(lm[11].x + lm[12].x) / 2 * w, (lm[11].y + lm[12].y) / 2 * h];
+        ctx.beginPath(); ctx.moveTo(hx, hy); ctx.lineTo(sx, sy); ctx.stroke();
+      }
+    }
+    const px = ctx.getImageData(0, 0, w, h).data;
+    for (let k = 0, j = 0; k < n; k++, j += 4) skel[k] = px[j] / 255;
+
+    // A generous zone around the skeleton for clothes and hair.
+    boxMean(skel, w, h, Math.max(2, Math.round(bodyH * 0.06)), zone, tmp);
+    const m = target.mask;
+    for (let k = 0; k < n; k++) {
+      const z = Math.min(1, zone[k] * 4);
+      let v = Math.min(z, Math.max(m[k], skel[k]));
+      for (const o of others) { // pixels another member clearly owns
+        const ov = o.mask[k];
+        if (ov > 0.5 && ov > m[k] + 0.15) { v = 0; break; }
+      }
+      skel[k] = v;
+    }
+    // Soften and grow slightly so the matting keeps fine edges.
+    boxMean(skel, w, h, Math.max(1, Math.round(Math.max(w, h) * 0.008)), out, tmp);
+    for (let k = 0; k < n; k++) out[k] = Math.min(1, out[k] * 1.6);
+    return out.slice();
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -212,16 +352,6 @@ function makeGuidedFilter(w, h) {
 // ---------------------------------------------------------------------------
 // Video helpers
 
-export function seek(video, time) {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => { cleanup(); reject(new Error('영상 탐색 시간이 초과됐어요.')); }, 10000);
-    const onSeeked = () => { cleanup(); resolve(); };
-    const cleanup = () => { clearTimeout(timer); video.removeEventListener('seeked', onSeeked); };
-    video.addEventListener('seeked', onSeeked);
-    video.currentTime = time;
-  });
-}
-
 function fitSize(w, h, maxSide) {
   const s = Math.min(1, maxSide / Math.max(w, h));
   return [Math.max(2, Math.round(w * s / 2) * 2), Math.max(2, Math.round(h * s / 2) * 2)];
@@ -247,7 +377,7 @@ export async function detectContentRect(video, start, end) {
   const rowLit = new Uint8Array(h), colLit = new Uint8Array(w);
   const samples = 6;
   for (let i = 0; i < samples; i++) {
-    await seek(video, start + (end - start) * (i + 0.5) / samples);
+    await seekVideo(video, start + (end - start) * (i + 0.5) / samples);
     ctx.drawImage(video, 0, 0, w, h);
     const d = ctx.getImageData(0, 0, w, h).data;
     for (let y = 0; y < h; y++) {
@@ -350,20 +480,27 @@ async function encodeAudio(audio, muxer) {
 // ---------------------------------------------------------------------------
 // Main pipeline
 
+const abortError = () => new DOMException('취소됨', 'AbortError');
+// Let the page handle taps (like 취소) between the heavy steps of a frame.
+const breathe = () => (globalThis.scheduler?.yield ? scheduler.yield() : new Promise(r => setTimeout(r, 0)));
+
 /**
  * @param {object} o
  * @param {File} o.file          source video file
  * @param {HTMLVideoElement} o.video  a loaded <video> for `file`
  * @param {number} o.start, o.end     trim range in seconds
  * @param {{x,y,w,h}} [o.rect] part of the frame to use (video pixels); whole frame if omitted
- * @param {object} o.target       person picked on the first frame (from detectPersons)
+ * @param {object} o.target       person picked on the first frame (from detect)
  * @param {number} o.fps, o.maxSide, o.bitrate
  * @param {boolean} o.withAudio
+ * @param {boolean} [o.useMatting]  use the GPU matting model when available (default true)
  * @param {(p:object)=>void} o.onProgress
  * @param {AbortSignal} o.signal
  */
 export async function extract(o) {
   const { video, start, end, fps, signal } = o;
+  const check = () => { if (signal?.aborted) throw abortError(); };
+
   const r = o.rect ?? fullRect(video);
   const [aw, ah] = analysisSize(r, o.maxSide);
   const [hw, hh] = fitSize(r.w, r.h, o.maxSide);
@@ -373,151 +510,213 @@ export async function extract(o) {
   const H = layout === 'sbs' ? hh : hh * 2;
   const alphaX = layout === 'sbs' ? hw : 0, alphaY = layout === 'sbs' ? 0 : hh;
 
-  const enc = await pickVideoEncoder(W, H, fps, o.bitrate);
-  const audio = o.withAudio ? await prepareAudio(o.file, start, end) : null;
-  if (signal?.aborted) throw new DOMException('취소됨', 'AbortError');
+  o.onProgress?.({ done: 0, total: 1, elapsed: 0, eta: 0, stage: '준비 중' });
+  let [source, matter] = await Promise.all([
+    openSource(o.file, video),
+    o.useMatting === false ? null : matting.createMatter(aw, ah).catch(err => { console.warn('matting off:', err); return null; }),
+  ]);
+  const cleanup = [() => source.close()];
+  try {
+    check();
+    const enc = await pickVideoEncoder(W, H, fps, o.bitrate);
 
-  const parts = [];
-  const muxer = new Muxer({
-    target: new StreamTarget({ onData: (data, position) => parts.push({ data: data.slice(), position }), chunked: true }),
-    video: { codec: enc.mux, width: W, height: H, frameRate: fps },
-    audio: audio ? { codec: audio.mux, numberOfChannels: audio.channels, sampleRate: audio.config.sampleRate } : undefined,
-    fastStart: 'fragmented',
-    firstTimestampBehavior: 'offset',
-  });
-
-  if (audio) await encodeAudio(audio, muxer);
-
-  let encodeError = null;
-  const encoder = new VideoEncoder({
-    output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
-    error: e => { encodeError = e; },
-  });
-  encoder.configure(enc.config);
-
-  // Canvases
-  const mk = (w, h) => { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; };
-  const aCanvas = mk(aw, ah), aCtx = aCanvas.getContext('2d', { willReadFrequently: true });
-  const mCanvas = mk(aw, ah), mCtx = mCanvas.getContext('2d');
-  const out = mk(W, H), oCtx = out.getContext('2d', { alpha: false });
-  oCtx.imageSmoothingEnabled = true;
-  oCtx.imageSmoothingQuality = 'high';
-  const maskImage = mCtx.createImageData(aw, ah);
-
-  const n = aw * ah;
-  const guide = new Float32Array(n), raw = new Float32Array(n), refined = new Float32Array(n);
-  let alpha = new Float32Array(n), prevAlpha = null;
-  const guided = makeGuidedFilter(aw, ah);
-  const radius = Math.max(2, Math.round(Math.max(aw, ah) / 110));
-
-  const total = Math.max(1, Math.floor((end - start) * fps));
-  const bounds = [1, 1, 0, 0];
-  let prev = o.target, lostFrames = 0, thumbnail = null;
-  const t0 = performance.now();
-
-  for (let i = 0; i < total; i++) {
-    if (signal?.aborted) { encoder.close(); throw new DOMException('취소됨', 'AbortError'); }
-    if (encodeError) throw encodeError;
-
-    // Aim for the middle of each output frame's time slot.
-    await seek(video, Math.min(start + (i + 0.5) / fps, video.duration - 0.001));
-    aCtx.drawImage(video, r.x, r.y, r.w, r.h, 0, 0, aw, ah);
-    const persons = await detect(aCanvas);
-    const person = prev ? track(persons, prev) : pickDefault(persons);
-
-    if (person && person.w === aw && person.h === ah) {
-      prev = person; lostFrames = 0;
-      const px = aCtx.getImageData(0, 0, aw, ah).data;
-      const others = persons.filter(q => q !== person && q.w === aw && q.h === ah).map(q => q.mask);
-      for (let k = 0, j = 0; k < n; k++, j += 4) {
-        guide[k] = (0.299 * px[j] + 0.587 * px[j + 1] + 0.114 * px[j + 2]) / 255;
-        // Where another member overlaps her, give the pixel to whoever the model is surer of.
-        let other = 0;
-        for (const m of others) if (m[k] > other) other = m[k];
-        raw[k] = other > person.mask[k] ? Math.max(0, person.mask[k] - other) : person.mask[k];
-      }
-      guided(guide, raw, radius, 0.004, refined);
-      for (let k = 0; k < n; k++) {
-        // Tighten the soft ramp: the model's masks run a little wide, which shows as a halo.
-        let v = (refined[k] - 0.32) / 0.42;
-        v = v < 0 ? 0 : v > 1 ? 1 : v;
-        alpha[k] = prevAlpha ? v * 0.85 + prevAlpha[k] * 0.15 : v; // calm frame-to-frame flicker
-      }
-    } else {
-      // Lost her this frame: fade out rather than risk showing someone else.
-      if (++lostFrames > fps) prev = null; // after ~1s, re-acquire the most central person
-      for (let k = 0; k < n; k++) alpha[k] = prevAlpha ? prevAlpha[k] * 0.5 : 0;
+    // Audio: copy it straight from the file when possible, else decode and re-encode.
+    let audioOut = null;
+    if (o.withAudio && source.audio) {
+      const c = source.audio.config;
+      audioOut = { codec: source.audio.mux, numberOfChannels: c.numberOfChannels, sampleRate: c.sampleRate };
     }
+    const reencode = o.withAudio && !audioOut ? await prepareAudio(o.file, start, end) : null;
+    if (reencode) audioOut = { codec: reencode.mux, numberOfChannels: reencode.channels, sampleRate: reencode.config.sampleRate };
+    check();
 
-    // Track the overall bounding box so the player can crop empty space.
-    for (let y = 0; y < ah; y += 2) {
-      for (let x = 0; x < aw; x += 2) {
-        if (alpha[y * aw + x] > 0.5) {
-          const nx = x / aw, ny = y / ah;
-          if (nx < bounds[0]) bounds[0] = nx; if (ny < bounds[1]) bounds[1] = ny;
-          if (nx > bounds[2]) bounds[2] = nx; if (ny > bounds[3]) bounds[3] = ny;
+    const parts = [];
+    const muxer = new Muxer({
+      target: new StreamTarget({ onData: (data, position) => parts.push({ data: data.slice(), position }), chunked: true }),
+      video: { codec: enc.mux, width: W, height: H, frameRate: fps },
+      audio: audioOut || undefined,
+      fastStart: 'fragmented',
+      firstTimestampBehavior: 'offset',
+    });
+
+    let hasAudio = false;
+    if (audioOut && source.audio && !reencode) {
+      let first = true;
+      for await (const chunk of source.audioChunks(start, end, signal)) {
+        muxer.addAudioChunk(chunk, first ? { decoderConfig: source.audio.config } : undefined);
+        first = false;
+        hasAudio = true;
+      }
+    } else if (reencode) {
+      await encodeAudio(reencode, muxer);
+      hasAudio = true;
+    }
+    check();
+
+    let encodeError = null;
+    const encoder = new VideoEncoder({
+      output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+      error: e => { encodeError = e; },
+    });
+    encoder.configure(enc.config);
+    cleanup.push(() => { if (encoder.state !== 'closed') encoder.close(); });
+
+    // Canvases
+    const mk = (w, h) => { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; };
+    const aCanvas = mk(aw, ah), aCtx = aCanvas.getContext('2d', { willReadFrequently: true });
+    const mCanvas = mk(aw, ah), mCtx = mCanvas.getContext('2d');
+    const out = mk(W, H), oCtx = out.getContext('2d', { alpha: false });
+    oCtx.imageSmoothingEnabled = true;
+    oCtx.imageSmoothingQuality = 'high';
+    aCtx.imageSmoothingQuality = 'high';
+    const maskImage = mCtx.createImageData(aw, ah);
+
+    const n = aw * ah;
+    const guide = new Float32Array(n), raw = new Float32Array(n), refined = new Float32Array(n);
+    let alpha = new Float32Array(n), prevAlpha = null;
+    const guided = makeGuidedFilter(aw, ah);
+    const buildRegion = makeRegionBuilder(aw, ah);
+    const radius = Math.max(2, Math.round(Math.max(aw, ah) / 110));
+    const tracker = new Tracker(o.target, fps);
+    let lastRegion = null;
+
+    const bounds = [1, 1, 0, 0];
+    let thumbnail = null, found = true;
+    const t0 = performance.now();
+    let total = Math.max(1, Math.floor((end - start) * fps));
+
+    for await (const f of source.frames(start, end, fps, signal)) {
+      check();
+      if (encodeError) throw encodeError;
+      const i = f.index;
+      total = f.total;
+
+      f.draw(aCtx, r, aw, ah);
+      const px = aCtx.getImageData(0, 0, aw, ah).data;
+      await breathe(); check();
+      const persons = await detect(aCanvas);
+      await breathe(); check();
+      const person = persons.length && persons[0].w === aw ? tracker.update(persons, px) : (tracker.lost++, null);
+      const others = person ? persons.filter(q => q !== person && q.w === aw && q.h === ah) : [];
+      found = !!person;
+      globalThis.__fancamDebug?.push({ i, n: persons.length, lost: tracker.lost,
+        people: persons.map(q => ({ cx: +q.cx.toFixed(3), cy: +q.cy.toFixed(3), area: +q.area.toFixed(3), me: q === person,
+          lm: q.landmarks.map(l => [+l.x.toFixed(3), +l.y.toFixed(3), +(l.visibility ?? 1).toFixed(2)]) })) });
+
+      let pha = null;
+      if (matter) {
+        try { pha = await matter.run(px); } catch (err) {
+          console.warn('GPU matting failed, continuing with the basic cut-out:', err);
+          matter = null;
         }
       }
+      if (pha) {
+        // GPU matting for the edges, limited to her region.
+        let region = null;
+        if (person) region = lastRegion = buildRegion(person, others);
+        else if (lastRegion && tracker.lost <= fps) region = lastRegion; // briefly missed: keep her area
+        for (let k = 0; k < n; k++) {
+          const v = region ? pha[k] * region[k] : 0;
+          alpha[k] = v < 0.02 ? 0 : v;
+        }
+      } else if (person) {
+        for (let k = 0, j = 0; k < n; k++, j += 4) {
+          guide[k] = (0.299 * px[j] + 0.587 * px[j + 1] + 0.114 * px[j + 2]) / 255;
+          // Where another member overlaps her, give the pixel to whoever the model is surer of.
+          let other = 0;
+          for (const q of others) if (q.mask[k] > other) other = q.mask[k];
+          raw[k] = other > person.mask[k] ? Math.max(0, person.mask[k] - other) : person.mask[k];
+        }
+        const region = buildRegion(person, others);
+        for (let k = 0; k < n; k++) raw[k] *= region[k];
+        guided(guide, raw, radius, 0.004, refined);
+        for (let k = 0; k < n; k++) {
+          // Tighten the soft ramp: the model's masks run a little wide, which shows as a halo.
+          let v = (refined[k] - 0.32) / 0.42;
+          v = v < 0 ? 0 : v > 1 ? 1 : v;
+          alpha[k] = prevAlpha ? v * 0.85 + prevAlpha[k] * 0.15 : v; // calm frame-to-frame flicker
+        }
+      } else {
+        // Missed her this frame: hold the last cut-out briefly, then fade, rather than show someone else.
+        const keep = tracker.lost <= Math.round(fps / 3) ? 1 : 0.6;
+        for (let k = 0; k < n; k++) alpha[k] = prevAlpha ? prevAlpha[k] * keep : 0;
+      }
+
+      // Track the overall bounding box so the player can crop empty space.
+      for (let y = 0; y < ah; y += 2) {
+        for (let x = 0; x < aw; x += 2) {
+          if (alpha[y * aw + x] > 0.5) {
+            const nx = x / aw, ny = y / ah;
+            if (nx < bounds[0]) bounds[0] = nx; if (ny < bounds[1]) bounds[1] = ny;
+            if (nx > bounds[2]) bounds[2] = nx; if (ny > bounds[3]) bounds[3] = ny;
+          }
+        }
+      }
+
+      const md = maskImage.data;
+      for (let k = 0, j = 0; k < n; k++, j += 4) {
+        const v = alpha[k] * 255;
+        md[j] = md[j + 1] = md[j + 2] = v; md[j + 3] = 255;
+      }
+      mCtx.putImageData(maskImage, 0, 0);
+      f.draw(oCtx, r, hw, hh);
+      oCtx.drawImage(mCanvas, alphaX, alphaY, hw, hh);
+
+      const frame = new VideoFrame(out, { timestamp: Math.round(i * 1e6 / fps), duration: Math.round(1e6 / fps) });
+      encoder.encode(frame, { keyFrame: i % fps === 0 });
+      frame.close();
+      while (encoder.encodeQueueSize > 3) { check(); await new Promise(res => setTimeout(res, 5)); }
+
+      if (!thumbnail && i >= Math.min(total - 1, Math.floor(total * 0.15))) {
+        thumbnail = await makeThumbnail(out, layout, hw, hh);
+      }
+
+      [alpha, prevAlpha] = [prevAlpha ?? new Float32Array(n), alpha];
+      const elapsed = (performance.now() - t0) / 1000;
+      o.onProgress?.({
+        done: i + 1, total, elapsed, eta: elapsed / (i + 1) * (total - i - 1),
+        preview: out, layout, found, matting: !!matter, decoder: source.kind,
+      });
     }
+    check();
 
-    const md = maskImage.data;
-    for (let k = 0, j = 0; k < n; k++, j += 4) {
-      const v = alpha[k] * 255;
-      md[j] = md[j + 1] = md[j + 2] = v; md[j + 3] = 255;
-    }
-    mCtx.putImageData(maskImage, 0, 0);
-    oCtx.drawImage(video, r.x, r.y, r.w, r.h, 0, 0, hw, hh);
-    oCtx.drawImage(mCanvas, alphaX, alphaY, hw, hh);
+    await encoder.flush();
+    encoder.close();
+    if (encodeError) throw encodeError;
+    muxer.finalize();
 
-    const frame = new VideoFrame(out, { timestamp: Math.round(i * 1e6 / fps), duration: Math.round(1e6 / fps) });
-    encoder.encode(frame, { keyFrame: i % fps === 0 });
-    frame.close();
-    while (encoder.encodeQueueSize > 3) await new Promise(r => setTimeout(r, 5));
+    parts.sort((a, b) => a.position - b.position);
+    const blob = new Blob(parts.map(p => p.data), { type: 'video/mp4' });
 
-    if (!thumbnail && i >= Math.min(total - 1, Math.floor(total * 0.15))) {
-      thumbnail = await makeThumbnail(video, r, mCanvas, hw, hh);
-    }
+    // Pad the crop a little and fall back to the full frame if she was never found.
+    const pad = 0.03;
+    const crop = bounds[2] > bounds[0]
+      ? { x: Math.max(0, bounds[0] - pad), y: Math.max(0, bounds[1] - pad),
+          w: Math.min(1, bounds[2] + pad + 2 / aw) - Math.max(0, bounds[0] - pad),
+          h: Math.min(1, bounds[3] + pad + 2 / ah) - Math.max(0, bounds[1] - pad) }
+      : { x: 0, y: 0, w: 1, h: 1 };
 
-    [alpha, prevAlpha] = [prevAlpha ?? new Float32Array(n), alpha];
-    const elapsed = (performance.now() - t0) / 1000;
-    o.onProgress?.({
-      done: i + 1, total, elapsed, eta: elapsed / (i + 1) * (total - i - 1),
-      preview: out, layout, found: lostFrames === 0,
-    });
+    return {
+      blob, thumbnail, layout, crop, width: hw, height: hh, fps,
+      duration: total / fps, hasAudio, codec: enc.config.codec,
+    };
+  } finally {
+    for (const c of cleanup.reverse()) { try { c(); } catch {} }
   }
-
-  await encoder.flush();
-  encoder.close();
-  if (encodeError) throw encodeError;
-  muxer.finalize();
-
-  parts.sort((a, b) => a.position - b.position);
-  const blob = new Blob(parts.map(p => p.data), { type: 'video/mp4' });
-
-  // Pad the crop a little and fall back to the full frame if she was never found.
-  const pad = 0.03;
-  const crop = bounds[2] > bounds[0]
-    ? { x: Math.max(0, bounds[0] - pad), y: Math.max(0, bounds[1] - pad),
-        w: Math.min(1, bounds[2] + pad + 2 / aw) - Math.max(0, bounds[0] - pad),
-        h: Math.min(1, bounds[3] + pad + 2 / ah) - Math.max(0, bounds[1] - pad) }
-    : { x: 0, y: 0, w: 1, h: 1 };
-
-  return {
-    blob, thumbnail, layout, crop, width: hw, height: hh, fps,
-    duration: total / fps, hasAudio: !!audio, codec: enc.config.codec,
-  };
 }
 
-async function makeThumbnail(video, r, maskCanvas, hw, hh) {
+// A transparent PNG of the current packed frame (colour half + alpha half).
+async function makeThumbnail(packed, layout, hw, hh) {
   const s = Math.min(1, 360 / Math.max(hw, hh));
   const w = Math.round(hw * s), h = Math.round(hh * s);
   const c = document.createElement('canvas'); c.width = w; c.height = h;
   const ctx = c.getContext('2d', { willReadFrequently: true });
-  ctx.drawImage(maskCanvas, 0, 0, w, h);
+  const ax = layout === 'sbs' ? hw : 0, ay = layout === 'sbs' ? 0 : hh;
+  ctx.drawImage(packed, ax, ay, hw, hh, 0, 0, w, h);
   const a = ctx.getImageData(0, 0, w, h);
-  ctx.drawImage(video, r.x, r.y, r.w, r.h, 0, 0, w, h);
+  ctx.drawImage(packed, 0, 0, hw, hh, 0, 0, w, h);
   const img = ctx.getImageData(0, 0, w, h);
   for (let j = 0; j < img.data.length; j += 4) img.data[j + 3] = a.data[j];
   ctx.putImageData(img, 0, 0);
-  return new Promise(r => c.toBlob(r, 'image/png'));
+  return new Promise(res => c.toBlob(res, 'image/png'));
 }

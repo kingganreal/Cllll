@@ -504,7 +504,7 @@ document.addEventListener('visibilitychange', () => {
 
 const create = {
   file: null, url: null, start: 0, end: 0, persons: null, target: null, abort: null, busy: false,
-  detectedRect: null,
+  detectedRect: null, runId: 0,
 
   // The area of the frame we work on: the picture without black bars, unless switched off.
   rect() {
@@ -519,12 +519,13 @@ const create = {
     if (typeof VideoEncoder === 'undefined') warn.push('이 브라우저는 영상 인코딩을 지원하지 않아요. 최신 Chrome, Edge, Safari(iOS 16.4 이상)에서 열어 주세요.');
     $('#create-error').hidden = !warn.length;
     $('#create-error').textContent = warn.join(' ');
-    // Load the model in the background so it's ready by the time she's picked.
+    // Load the models in the background so they're ready by the time she's picked.
     import('./processor.js').then(p => p.getLandmarker()).catch(err => console.warn(err));
+    import('./matting.js').then(m => m.preload()).catch(() => {});
   },
 
   leave() {
-    if (this.busy) this.abort?.abort();
+    if (this.busy) this.cancel();
     keepAwake(false);
   },
 
@@ -672,6 +673,7 @@ const create = {
     const name = $('#clip-name').value.trim() || '설윤';
 
     this.busy = true;
+    const runId = ++this.runId;
     this.abort = new AbortController();
     opts.signal = this.abort.signal;
     $('#step-edit').hidden = true;
@@ -680,13 +682,17 @@ const create = {
     keepAwake(true);
     const pc = $('#progress-canvas'), pctx = pc.getContext('2d');
     let lastDraw = 0;
+    $('#progress-text').textContent = 'AI 준비 중…';
     opts.onProgress = info => {
+      if (runId !== this.runId) return;
+      if (info.stage) { $('#progress-text').textContent = info.stage + '…'; return; }
       const pct = info.done / info.total * 100;
       $('#progress-bar').style.width = pct.toFixed(1) + '%';
+      const mode = info.matting ? 'GPU 고급 누끼' : '기본 누끼';
       $('#progress-text').textContent =
-        `${info.done} / ${info.total} 프레임 · ${pct.toFixed(0)}% · 남은 시간 약 ${fmtTime(info.eta)}${info.found ? '' : ' · 멤버를 놓쳤어요, 다시 찾는 중'}`;
+        `${info.done} / ${info.total} 프레임 · ${pct.toFixed(0)}% · 남은 시간 약 ${fmtTime(info.eta)}\n${mode}${info.found ? '' : ' · 멤버를 놓쳐서 다시 찾는 중'}`;
       const now = performance.now();
-      if (now - lastDraw > 250) {
+      if (now - lastDraw > 250 && info.preview) {
         lastDraw = now;
         if (pc.width !== info.preview.width) { pc.width = info.preview.width; pc.height = info.preview.height; }
         pctx.drawImage(info.preview, 0, 0);
@@ -694,6 +700,7 @@ const create = {
     };
     try {
       const result = await p.extract(opts);
+      if (runId !== this.runId) return; // cancelled meanwhile
       const clip = { id: uid(), name, created: Date.now(), ...result };
       await clips.put(clip);
       requestPersistence();
@@ -702,6 +709,7 @@ const create = {
       this.done();
       await stage.addAndOpen(clip.id);
     } catch (err) {
+      if (runId !== this.runId) return; // cancelled: the screen was already reset
       this.done();
       if (err.name !== 'AbortError') {
         console.error(err);
@@ -709,6 +717,15 @@ const create = {
         $('#create-error').hidden = false;
       }
     }
+  },
+
+  // Stop right away: reset the screen now; the work still in flight notices the abort and quits.
+  cancel() {
+    if (!this.busy) return;
+    this.abort?.abort();
+    this.runId++;
+    this.done();
+    toast('취소했어요');
   },
 
   done() {
@@ -765,7 +782,7 @@ $('#btn-start').addEventListener('click', () => create.run());
 $('#auto-crop').addEventListener('change', () => create.reset());
 // The pick is analysed at a size that depends on quality, so re-pick after changing it.
 $('#quality').addEventListener('change', () => { if (create.persons) create.reset(); });
-$('#btn-cancel').addEventListener('click', () => create.abort?.abort());
+$('#btn-cancel').addEventListener('click', () => create.cancel());
 
 // ---------------------------------------------------------------------------
 // YouTube: the browser can't download from YouTube, so we record it while it plays.

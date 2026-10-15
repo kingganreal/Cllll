@@ -203,7 +203,7 @@ input[type=range] { width: 100%; accent-color: var(--accent); }
 .progress-info { display: grid; gap: 10px; }
 .bar { height: 8px; border-radius: 99px; background: var(--line); overflow: hidden; }
 .bar span { display: block; height: 100%; width: 0; background: linear-gradient(90deg, var(--accent), var(--cool)); transition: width .2s; }
-#progress-text { margin: 0; }
+#progress-text { margin: 0; white-space: pre-line; }
 
 /* ---------- stage ---------- */
 .stage-view { position: fixed; inset: 0; overflow: hidden; }
