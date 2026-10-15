@@ -517,6 +517,8 @@ const create = {
   },
 
   enter() {
+    // "새 클립 만들기" always starts from an empty page, not the last video.
+    if (!this.busy && !youtubeHelper.busy && capture.recorder?.state !== 'recording') this.clear();
     const warn = [];
     if (typeof VideoEncoder === 'undefined') warn.push('이 브라우저는 영상 인코딩을 지원하지 않아요. 최신 Chrome, Edge, Safari(iOS 16.4 이상)에서 열어 주세요.');
     $('#create-error').hidden = !warn.length;
@@ -529,6 +531,25 @@ const create = {
   leave() {
     if (this.busy) this.cancel();
     keepAwake(false);
+  },
+
+  clear() {
+    this.file = this.detectedRect = this.tap = null;
+    if (this.url) URL.revokeObjectURL(this.url);
+    this.url = null;
+    const v = $('#src-video');
+    v.removeAttribute('src');
+    v.load();
+    $('#step-edit').hidden = true;
+    $('#crop-row').hidden = true;
+    $('#drop').classList.remove('compact');
+    $('#drop strong').textContent = '직캠 영상 고르기';
+    $('#yt-url').value = '';
+    $('#yt-help').hidden = true;
+    $('#yt-help').innerHTML = '';
+    clearInterval(youtubeHelper.checkTimer);
+    delete $('#clip-name').dataset.touched;
+    this.reset();
   },
 
   reset() {
