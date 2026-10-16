@@ -126,7 +126,9 @@ Releases에 올려요. 새 버전을 내려면 `desktop/package.json`의 `versio
 
 - **GitHub Pages**: 저장소 Settings → Pages → Source를 "GitHub Actions"로 바꾸면
   `.github/workflows/pages.yml`이 자동으로 배포해요. 나온 주소를 폰에서 열고 "홈 화면에 추가"하세요.
-- **내 PC에서**: `npx http-server .` 후 `http://localhost:8080` 접속.
+- **내 PC에서**: `start.bat`을 더블클릭하세요. 웹앱(`http://localhost:8080`)이 크롬에 열리고, 윈도우 앱(설치돼 있으면
+  설치된 FancamStage, 아니면 `desktop/`을 바로 실행)이 같이 켜져서 클립의 **바탕화면에** 버튼이 생겨요.
+  검은 창을 닫으면 웹앱이 꺼져요. (직접 하려면 `npx http-server .` 후 `http://localhost:8080`.)
   같은 와이파이의 폰에서 열려면 HTTPS가 필요해서 Pages 쪽이 편해요.
 
 ## 구조
