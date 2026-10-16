@@ -17,7 +17,12 @@ class GpuWorker {
     this.onProgress = null;
     this.worker.onmessage = ({ data }) => {
       if (data.type === 'trust') { try { localStorage.setItem(TRUST_KEY, JSON.stringify(data.value)); } catch {} return; }
-      if (data.type === 'progress') { this.onProgress?.(data.value); return; }
+      if (data.type === 'progress') {
+        // Still downloading: that's not hanging, so the deadlines start over.
+        for (const call of this.calls.values()) if (call.timeout) { clearTimeout(call.timer); call.timer = this.deadline(call); }
+        this.onProgress?.(data.value);
+        return;
+      }
       const call = this.calls.get(data.id);
       if (!call) return;
       this.calls.delete(data.id);
@@ -39,10 +44,15 @@ class GpuWorker {
     if (this.dead) return Promise.reject(new Error(this.dead));
     return new Promise((resolve, reject) => {
       const id = this.nextId++;
-      const timer = timeout ? setTimeout(() => this.kill(`GPU가 응답하지 않아요 (${method})`), timeout) : 0;
-      this.calls.set(id, { resolve, reject, timer });
+      const call = { resolve, reject, method, timeout };
+      call.timer = timeout ? this.deadline(call) : 0;
+      this.calls.set(id, call);
       this.worker.postMessage({ id, method, args }, transfer);
     });
+  }
+
+  deadline(call) {
+    return setTimeout(() => this.kill(`GPU가 응답하지 않아요 (${call.method})`), call.timeout);
   }
 
   kill(reason) {

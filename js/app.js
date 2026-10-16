@@ -731,12 +731,49 @@ const create = {
       const v = $('#src-video');
       v.pause();
       btn.textContent = '사람 찾는 중…';
-      await p.seek(v, this.start + 0.02);
       const r = this.rect();
       const [aw, ah] = p.analysisSize(r, Number($('#quality').value));
       const c = document.createElement('canvas'); c.width = aw; c.height = ah;
-      c.getContext('2d').drawImage(v, r.x, r.y, r.w, r.h, 0, 0, aw, ah);
-      this.persons = await p.detect(c);
+      // Everyone in the frame at time t (the video is left showing that frame).
+      const look = async t => {
+        await p.seek(v, t + 0.02);
+        c.getContext('2d').drawImage(v, r.x, r.y, r.w, r.h, 0, 0, aw, ah);
+        return p.detect(c);
+      };
+      // With her face registered, pick her by face.
+      const ref = await faces.reference();
+      let f = null, m = null;
+      if (ref) {
+        try { f = await import('./face.js'); m = await f.load(); } catch (err) { console.warn('face models off', err); }
+      }
+      const byFace = async persons => {
+        try {
+          const found = await f.faces(m, ctx => ctx.drawImage(v, r.x, r.y, r.w, r.h, 0, 0, r.w, r.h), r.w, r.h,
+            { minSize: Math.max(r.w, r.h) * 0.012 });
+          const her = f.findHer(found, ref);
+          const who = her && await p.personAtFace(c, persons, her, r.w, r.h);
+          globalThis.__fancamDebug?.push({ pick: found.map(fc => ({ sim: +fc.sim.toFixed(3), size: Math.round(fc.size), box: fc.box.map(Math.round) })), her: !!her, who: !!who });
+          return who ? { who, her } : null;
+        } catch (err) { console.warn('face pick failed', err); return null; }
+      };
+      let persons = await look(this.start), hit = null, moved = 0;
+      if (m) {
+        btn.textContent = '얼굴 찾는 중…';
+        hit = await byFace(persons);
+        // Her face isn't visible at the start (turned away, hidden): look up to 3 s further on and
+        // start there instead.
+        for (let dt = 0.5; !hit && dt <= 3 && this.start + dt < this.end - 1; dt += 0.5) {
+          const ps = await look(this.start + dt);
+          const h = ps.length ? await byFace(ps) : null;
+          if (h) { hit = h; persons = ps; moved = dt; }
+        }
+        if (!hit) persons = await look(this.start);
+      }
+      if (moved) {
+        this.start += moved;
+        this.updateTrim();
+      }
+      this.persons = persons;
       if (!this.persons.length) {
         throw new Error('시작 장면에서 사람을 찾지 못했어요. 시작 지점을 멤버가 잘 보이는 곳으로 옮겨 주세요.');
       }
@@ -744,28 +781,15 @@ const create = {
       this.tap = null;
       this.tapped = false;
       this.pickApi = p;
-      // With her face registered, pick her by face.
-      this.faceFound = null;
+      this.faceFound = m ? !!hit : null;
+      this.faceMoved = moved;
       this.faceSeed = null;
-      const ref = await faces.reference();
-      if (ref) {
-        btn.textContent = '얼굴 찾는 중…';
-        try {
-          const f = await import('./face.js');
-          const m = await f.load();
-          const found = await f.faces(m, ctx => ctx.drawImage(v, r.x, r.y, r.w, r.h, 0, 0, r.w, r.h), r.w, r.h,
-            { minSize: Math.max(r.w, r.h) * 0.012 });
-          const her = f.findHer(found, ref);
-          const who = her && await p.personAtFace(c, this.persons, her, r.w, r.h);
-          this.faceFound = !!who;
-          globalThis.__fancamDebug?.push({ pick: found.map(fc => ({ sim: +fc.sim.toFixed(3), size: Math.round(fc.size), box: fc.box.map(Math.round) })), her: !!her, who: !!who });
-          if (who) {
-            if (!this.persons.includes(who)) this.persons.push(who);
-            this.target = who;
-            this.faceSeed = her.emb;
-            this.tap = [(her.box[0] + her.box[2]) / 2 / r.w, (her.box[1] + her.box[3]) / 2 / r.h];
-          }
-        } catch (err) { console.warn('face pick failed', err); }
+      if (hit) {
+        const { who, her } = hit;
+        if (!this.persons.includes(who)) this.persons.push(who);
+        this.target = who;
+        this.faceSeed = her.emb;
+        this.tap = [(her.box[0] + her.box[2]) / 2 / r.w, (her.box[1] + her.box[3]) / 2 / r.h];
       }
       this.drawPick();
       $('#pick-canvas').hidden = false;
@@ -792,7 +816,8 @@ const create = {
       return ix * iy > (t.bbox[2] - t.bbox[0]) * (t.bbox[3] - t.bbox[1]) * 0.08;
     });
     const byFace = this.faceFound && !this.tapped;
-    hint.textContent = (byFace ? '얼굴로 설윤을 찾았어요. ' : this.faceFound === false && !this.tapped ? '이 장면에선 얼굴로 못 찾았어요. 직접 탭해 주세요 (만드는 동안에도 얼굴로 계속 확인해요). ' : '')
+    hint.textContent = (byFace && this.faceMoved ? `시작 장면엔 얼굴이 안 보여서, 얼굴이 보이는 ${this.faceMoved}초 뒤로 시작 지점을 옮기고 설윤을 찾았어요. `
+      : byFace ? '얼굴로 설윤을 찾았어요. ' : this.faceFound === false && !this.tapped ? '이 장면에선 얼굴로 못 찾았어요. 직접 탭해 주세요 (만드는 동안에도 얼굴로 계속 확인해요). ' : '')
       + (overlap
         ? '고른 멤버가 다른 멤버와 겹쳐 있어요. 혼자 잘 보이는 장면을 시작 지점으로 고르면 더 정확해요.'
         : byFace ? '아니면 탭해서 바꿀 수 있어요.' : '따낼 멤버를 탭하세요. 분홍색으로 표시된 사람만 남아요.');

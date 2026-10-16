@@ -538,7 +538,7 @@ function makeSamRegion(w, h) {
         const fx = Math.max(0, (x + 0.5) / w * 256 - 0.5), x0 = Math.floor(fx), x1 = Math.min(255, x0 + 1), wx = fx - x0;
         const v = (low[y0 * 256 + x0] * (1 - wx) + low[y0 * 256 + x1] * wx) * (1 - wy)
           + (low[y1 * 256 + x0] * (1 - wx) + low[y1 * 256 + x1] * wx) * wy;
-        core[y * w + x] = 1 / (1 + Math.exp(-v));
+        core[y * w + x] = v === v ? 1 / (1 + Math.exp(-v)) : 0; // NaN (a bad GPU step): not her
       }
     }
     const side = Math.max(w, h);
@@ -550,8 +550,13 @@ function makeSamRegion(w, h) {
     boxMean(hard, w, h, Math.max(2, Math.round(side * (0.01 + 0.005 * (every - 1)))), shrunk, tmp);
     const inner = new Float32Array(n);
     for (let k = 0; k < n; k++) { const v = (shrunk[k] - 0.92) / 0.08; inner[k] = v <= 0 ? 0 : v >= 1 ? 1 : v; }
+    // Her area for the matting model: firm out to most of the margin, so the matte isn't cut part
+    // way into her edges (that cut moved with every SAM step and made the edges shimmer).
+    const area = new Float32Array(n);
+    for (let k = 0; k < n; k++) { const v = (grown[k] - 0.1) / 0.25; area[k] = v <= 0 ? 0 : v >= 1 ? 1 : v * v * (3 - 2 * v); }
     region.core = core.slice();
     region.inner = inner;
+    region.area = area;
     return region;
   };
 }
@@ -668,18 +673,18 @@ export async function extract(o) {
     gpu.onProgress = f => o.onProgress?.({ done: 0, total: 1, elapsed: 0, eta: 0, stage: `SAM 2 추적 모델 받는 중 ${Math.round(f * 100)}%` });
   }
   const off = what => err => { console.warn(what + ' off:', err); return null; };
-  // Loading deadlines: generous (creating sessions takes a while); SAM 2 also downloads ~100 MB once.
-  const LOAD = 180000, SAM_LOAD = 600000;
+  // Loading deadlines. Each model loads in a few seconds once downloaded, but now and then the
+  // worker's GPU never gets going; then a fresh worker usually does. (SAM 2's ~100 MB first download
+  // reports progress, which restarts the deadline.)
+  const LOAD = 45000, SAM_LOAD = 60000;
   // The matting model in the worker (whichever worker is current).
   const workerMatter = () => ({
     run(px) { const copy = px.slice(); return gpu.call('matte', [copy], { timeout: 20000, transfer: [copy.buffer] }); },
   });
   // One after another, each with its own deadline: in the worker they'd queue behind each other
   // anyway, and a deadline shouldn't count the time spent waiting for the others.
-  // (After a GPU failure the models are already downloaded, so a restart gets shorter deadlines:
-  // right after the GPU was reset, a new worker sometimes never got going.)
-  const loadGpuModels = async (restart = false) => {
-    const load = restart ? 60000 : LOAD, samLoad = restart ? 120000 : SAM_LOAD;
+  const loadGpuModels = async () => {
+    const load = LOAD, samLoad = SAM_LOAD;
     const m = o.useMatting === false ? null
       : await gpu.call('mattingCreate', [aw, ah], { timeout: load }).then(workerMatter).catch(off('matting'));
     const samOk = o.useSam !== false && !gpu.dead && await gpu.call('samLoad', [], { timeout: samLoad }).then(() => true, off('SAM 2'));
@@ -757,6 +762,7 @@ export async function extract(o) {
     const n = aw * ah;
     const guide = new Float32Array(n), raw = new Float32Array(n), refined = new Float32Array(n);
     let alpha = new Float32Array(n), prevAlpha = null;
+    let prevGray = null; // last frame's brightness, for smoothing still edges
     const guided = makeGuidedFilter(aw, ah);
     const buildRegion = makeRegionBuilder(aw, ah);
     const radius = Math.max(2, Math.round(Math.max(aw, ah) / 110));
@@ -820,7 +826,7 @@ export async function extract(o) {
       gpu = gpuWorker();
       configure();
       matter = null;
-      gpuRestarting = loadGpuModels(true).then(([m, samBack, faceBack]) => {
+      gpuRestarting = loadGpuModels().then(([m, samBack, faceBack]) => {
         matter = m;
         samRestart = !!samBack;
         if (faceBack && faceModels) faceModels = { ...faceModels, gpu };
@@ -860,6 +866,12 @@ export async function extract(o) {
         target: target || { cx, cy, landmarks: [], bbox: null }, tap: [cx, cy],
         others: persons.filter(p => p !== target),
       });
+      if (!target?.landmarks?.length) {
+        // No skeleton for her: a face alone makes SAM pick just her head and shoulders (and then
+        // remember that), so also point at where her body is, below her face.
+        const fh = (her.box[3] - her.box[1]) / r.h;
+        for (const dy of [2.5, 5, 7.5]) if (cy + dy * fh < 0.98) { pts.push([cx * sam2.SIZE, (cy + dy * fh) * sam2.SIZE]); labels.push(1); }
+      }
       for (const fc of found) {
         if (fc === her) continue;
         const x = (fc.box[0] + fc.box[2]) / 2 / r.w, y = (fc.box[1] + fc.box[3]) / 2 / r.h;
@@ -867,6 +879,7 @@ export async function extract(o) {
       }
       return [pts, labels, box];
     };
+    let offFace = 0; // face checks in a row where the tracker's mask missed her face
 
     const bounds = [1, 1, 0, 0];
     let thumbnail = null, found = true;
@@ -953,7 +966,11 @@ export async function extract(o) {
                   // A face right next to hers (someone just behind her) can't be cut away cleanly; ignore it.
                   const apart = fc => Math.hypot((fc.box[0] + fc.box[2] - her.box[0] - her.box[2]) / 2,
                     (fc.box[1] + fc.box[3] - her.box[1] - her.box[3]) / 2) > 1.5 * (her.box[2] - her.box[0]);
-                  if (faceIn(her, mask) < 0.6 || strangers.some(apart)) {
+                  // Off her face once can be a turn of the head; twice in a row, or someone else's
+                  // face in the mask, and the tracker has drifted.
+                  offFace = faceIn(her, mask) < 0.6 ? offFace + 1 : 0;
+                  if (offFace >= 2 || strangers.some(apart)) {
+                    offFace = 0;
                     // Drifted (or spread onto someone else): start again from her face.
                     sam = samTracker;
                     const again = await sam.start(input, ...(await promptFromFace(her, found)));
@@ -991,7 +1008,32 @@ export async function extract(o) {
             alpha.fill(0); // not her (or SAM says she isn't in view)
           } else if (pha) {
             const inner = samRegion.inner;
-            for (let k = 0; k < n; k++) { const v = Math.max(pha[k] * samRegion[k], inner[k]); alpha[k] = v < 0.02 ? 0 : v; }
+            if (globalThis.__FANCAM_ALPHA_OLD__) {
+              for (let k = 0; k < n; k++) { const v = Math.max(pha[k] * samRegion[k], inner[k]); alpha[k] = v < 0.02 ? 0 : v; }
+            } else {
+              // The matte inside her area, with the faint haze around her (stage light, blur the
+              // model half-keeps) cut. Where the picture didn't change since
+              // the last frame, lean on the last matte so still edges don't shimmer; where it did,
+              // take the new one (no trails behind a moving arm).
+              const area = samRegion.area;
+              for (let k = 0, j = 0; k < n; k++, j += 4) {
+                let v = Math.max(pha[k] * area[k], inner[k]);
+                // Below 10% is haze; hair strands (30-70%) stay nearly as they were.
+                v = (v - 0.1) / 0.85;
+                // (also catches NaN: a bad value would otherwise be carried into every later frame)
+                v = v > 0 ? (v >= 1 ? 1 : v) : 0;
+                const g = 0.299 * px[j] + 0.587 * px[j + 1] + 0.114 * px[j + 2];
+                if (prevAlpha && prevGray) {
+                  // Moved if the picture changed, or if the matte changed a lot (dark hair moving
+                  // over a dark stage barely changes the picture).
+                  const pa = prevAlpha[k];
+                  const d = Math.max(Math.abs(g - prevGray[k]) / 12, Math.abs(v - pa) / 0.25);
+                  const w = d < 0.4 ? 0.4 : d > 1 ? 1 : d;
+                  v = pa + w * (v - pa);
+                }
+                alpha[k] = v < 0.02 ? 0 : v;
+              }
+            }
           } else {
             // No matting model: snap SAM's soft mask to colour edges instead.
             for (let k = 0, j = 0; k < n; k++, j += 4) guide[k] = (0.299 * px[j] + 0.587 * px[j + 1] + 0.114 * px[j + 2]) / 255;
@@ -1115,6 +1157,8 @@ export async function extract(o) {
         }
 
         [alpha, prevAlpha] = [prevAlpha ?? new Float32Array(n), alpha];
+        prevGray ??= new Float32Array(n);
+        for (let k = 0, j = 0; k < n; k++, j += 4) prevGray[k] = 0.299 * px[j] + 0.587 * px[j + 1] + 0.114 * px[j + 2];
         mark('rest');
         const elapsed = (performance.now() - t0) / 1000;
         o.onProgress?.({
