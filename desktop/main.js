@@ -37,6 +37,19 @@ function boundsFor(s, clip) {
   return { x: Math.round(s.x), y: Math.round(s.y), width: w, height: h };
 }
 
+// "Always on top" that also stays above a video or game in (borderless) full screen: the highest
+// level, and since Windows can still slip a full-screen app over topmost windows, put them back on
+// top every couple of seconds. (Exclusive full-screen games draw past every window; nothing helps.)
+function pinOnTop(win, on) {
+  win.setAlwaysOnTop(on, on ? 'screen-saver' : 'normal');
+  win.setVisibleOnAllWorkspaces(on, { visibleOnFullScreen: true });
+}
+setInterval(() => {
+  for (const { win, s } of overlays.values()) {
+    if (s.onTop !== false && !win.isDestroyed() && win.isVisible()) win.moveTop();
+  }
+}, 2000);
+
 function openOverlay(s) {
   const clip = store.getClip(s.clipId);
   if (!clip) return null;
@@ -50,7 +63,7 @@ function openOverlay(s) {
       backgroundThrottling: false,
     },
   });
-  if (s.onTop !== false) win.setAlwaysOnTop(true, 'floating');
+  if (s.onTop !== false) pinOnTop(win, true);
   win.setOpacity(s.opacity || 1);
   // Start click-through; the page turns clicks back on while the cursor is over her.
   win.setIgnoreMouseEvents(true, { forward: true });
@@ -100,7 +113,7 @@ function update(id, patch) {
     o.s.x = b.x; o.s.y = b.y;
     o.win.setBounds(b);
   }
-  if ('onTop' in patch) o.win.setAlwaysOnTop(!!patch.onTop, 'floating');
+  if ('onTop' in patch) pinOnTop(o.win, !!patch.onTop);
   if ('opacity' in patch) o.win.setOpacity(patch.opacity);
   o.win.webContents.send('state', o.s);
 }
