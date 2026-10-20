@@ -239,6 +239,10 @@ class Frames:
         self.cache[i] = img
         return img
 
+    def close(self):
+        self.cap.release()
+        self.cache.clear()
+
     def forget_before(self, i):
         for k in [k for k in self.cache if k < i]:
             del self.cache[k]
@@ -567,6 +571,7 @@ def make_clip(video, out_dir, name='설윤', photos=(), start=0.0, end=None, fps
             break
         i0, prompt = restart
     written = next_i - skip
+    frames.close()
     bar.close()
     ff.stdin.close()
     ff.wait()

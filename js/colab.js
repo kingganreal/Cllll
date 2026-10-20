@@ -60,6 +60,24 @@ export async function extract(file, params, options) {
   }
 }
 
+// Runs task(0..count-1) with at most `width` going at once.
+async function parallel(count, width, task) {
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(width, count) }, async () => {
+    while (next < count) await task(next++);
+  }));
+}
+
+// A piece that fails over a flaky tunnel is tried again a couple of times.
+async function retry(fn, tries = 3) {
+  for (let t = 1; ; t++) {
+    try { return await fn(); } catch (err) {
+      if (t >= tries || err.name === 'AbortError') throw err;
+      await new Promise(r => setTimeout(r, 1000 * t));
+    }
+  }
+}
+
 async function run(file, params, { onProgress, stop, signal }) {
   const id = (await (await call('/jobs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(params) })).json()).id;
   const cancel = () => call(`/jobs/${id}`, { method: 'DELETE' }).catch(() => {});
@@ -67,12 +85,14 @@ async function run(file, params, { onProgress, stop, signal }) {
   const aborted = () => { if (signal?.aborted) throw new DOMException('취소됨', 'AbortError'); };
   try {
     // From YouTube: the server downloads it itself (faster than sending a big original from here).
+    // A quick tunnel is slow per connection, so the pieces go several at a time.
     const parts = params.url ? 0 : Math.max(1, Math.ceil(file.size / PART));
-    for (let i = 0; i < parts; i++) {
+    let sent = 0;
+    await parallel(parts, 3, async i => {
       aborted();
-      onProgress?.({ stage: `코랩으로 영상 보내는 중 ${Math.round(i / parts * 100)}%` });
-      await call(`/jobs/${id}/part?i=${i}`, { method: 'PUT', body: file.slice(i * PART, (i + 1) * PART) });
-    }
+      await retry(() => call(`/jobs/${id}/part?i=${i}`, { method: 'PUT', body: file.slice(i * PART, (i + 1) * PART) }));
+      onProgress?.({ stage: `코랩으로 영상 보내는 중 ${Math.round(++sent / parts * 100)}%` });
+    });
     await call(`/jobs/${id}/start`, { method: 'POST' });
     const t0 = performance.now();
     let stopSent = false, s;
@@ -93,18 +113,17 @@ async function run(file, params, { onProgress, stop, signal }) {
       }
     }
     onProgress?.({ stage: '완성된 클립 받는 중' });
-    const res = await call(`/jobs/${id}/result`);
-    const meta = JSON.parse(res.headers.get('X-Clip') || '{}');
-    // Read it in pieces so the screen can show how far along it is.
-    const size = Number(res.headers.get('Content-Length')) || 0, reader = res.body.getReader(), pieces = [];
+    // Several ranges at once, for the same reason as the upload.
+    const { size, meta } = await (await call(`/jobs/${id}/info`)).json();
+    const RANGE = 8 * 1024 * 1024, n = Math.max(1, Math.ceil(size / RANGE)), pieces = new Array(n);
     let got = 0;
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      pieces.push(value);
-      got += value.byteLength;
-      if (size) onProgress?.({ stage: `완성된 클립 받는 중 ${Math.round(got / size * 100)}% (${(size / 1048576).toFixed(0)}MB)` });
-    }
+    await parallel(n, 6, async i => {
+      aborted();
+      const a = i * RANGE, b = Math.min(size, a + RANGE) - 1;
+      pieces[i] = await retry(async () => (await call(`/jobs/${id}/result`, { headers: { Range: `bytes=${a}-${b}` } })).blob());
+      got += b - a + 1;
+      onProgress?.({ stage: `완성된 클립 받는 중 ${Math.round(got / size * 100)}% (${(size / 1048576).toFixed(0)}MB)` });
+    });
     const blob = new Blob(pieces, { type: 'video/mp4' });
     call(`/jobs/${id}`, { method: 'DELETE' }).catch(() => {}); // free the server's disk
     return { blob, meta };

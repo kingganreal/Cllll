@@ -10,7 +10,9 @@ goes into the app together with a random key (every request must carry it). One 
   GET  /jobs/<id>                      {state, done, total, stage, error}
   POST /jobs/<id>/stop                 finish early, keeping what's made (여기까지 저장)
   DELETE /jobs/<id>                    cancel and forget
-  GET  /jobs/<id>/result               the clip (packed MP4); details in X-Clip (JSON)
+  GET  /jobs/<id>/info                 the finished clip's size and details
+  GET  /jobs/<id>/result               the clip (packed MP4), whole or a Range of it (the app fetches
+                                       several ranges at once: a quick tunnel is slow per connection)
 """
 import json
 import os
@@ -68,7 +70,10 @@ def worker():
                 on_progress=progress, should_stop=lambda: job['stop'], cancelled=lambda: job['state'] == 'cancelled')
             job['result'] = r
             job['state'] = 'done'
-            os.remove(src)
+            try:
+                os.remove(src)
+            except OSError:
+                pass
         except fancam.Stopped:
             job['state'] = 'cancelled'
         except Exception as err:
@@ -85,7 +90,7 @@ class Handler(BaseHTTPRequestHandler):
     def cors(self):
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type, X-Key')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, X-Key, Range')
         self.send_header('Access-Control-Expose-Headers', 'X-Clip')
 
     def send(self, code, obj):
@@ -152,20 +157,34 @@ class Handler(BaseHTTPRequestHandler):
             job['state'] = 'cancelled'
             threading.Timer(30, lambda: (jobs.pop(job['id'], None), shutil.rmtree(job['dir'], ignore_errors=True))).start()
             return self.send(200, {'ok': True})
-        if sub == '/result' and method == 'GET':
+        if sub in ('/result', '/info') and method == 'GET':
             r = job['result']
             if not r:
                 return self.send(409, {'error': '아직 안 끝났어요.'})
             size = os.path.getsize(r['path'])
-            self.send_response(200)
+            meta = {k: r[k] for k in ('layout', 'width', 'height', 'duration', 'fixes', 'partial')}
+            if sub == '/info':
+                return self.send(200, {'size': size, 'meta': meta})
+            rng = re.match(r'bytes=(\d+)-(\d*)', self.headers.get('Range', ''))
+            a = int(rng.group(1)) if rng else 0
+            b = min(size - 1, int(rng.group(2))) if rng and rng.group(2) else size - 1
+            self.send_response(206 if rng else 200)
             self.cors()
             self.send_header('Content-Type', 'video/mp4')
-            self.send_header('Content-Length', str(size))
-            meta = {k: r[k] for k in ('layout', 'width', 'height', 'duration', 'fixes', 'partial')}
+            self.send_header('Content-Length', str(b - a + 1))
+            if rng:
+                self.send_header('Content-Range', f'bytes {a}-{b}/{size}')
             self.send_header('X-Clip', json.dumps(meta))
             self.end_headers()
             with open(r['path'], 'rb') as f:
-                shutil.copyfileobj(f, self.wfile, 1 << 20)
+                f.seek(a)
+                left = b - a + 1
+                while left > 0:
+                    chunk = f.read(min(left, 1 << 20))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    left -= len(chunk)
             return
         return self.send(404, {'error': 'not found'})
 
