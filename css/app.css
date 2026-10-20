@@ -118,6 +118,10 @@ button, input, select { font: inherit; color: inherit; }
 .error { margin: 0; color: var(--danger); }
 .hint { margin: 0; font-size: 13px; color: var(--muted); }
 .hint.warn { color: #ffcf7a; }
+.colab summary { cursor: pointer; margin-bottom: 8px; }
+.colab .hint { margin-top: 6px; }
+.colab-state.ok { color: #8fe3a8; }
+.colab-state.warn { color: #ffcf7a; }
 
 /* ---------- sync ---------- */
 .sync { display: grid; gap: 12px; padding: 16px; border-radius: var(--radius); background: var(--panel); border: 1px solid var(--line); }

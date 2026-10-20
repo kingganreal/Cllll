@@ -198,6 +198,14 @@
             </div>
           </div>
 
+          <details id="colab-box" class="field colab">
+            <summary class="label">코랩 GPU로 처리 <span id="colab-state" class="colab-state"></span></summary>
+            <input id="colab-url" type="text" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false"
+              placeholder="코랩 노트북에 나온 주소 (https://….trycloudflare.com/#key=…)">
+            <p class="hint">코랩 노트북(colab/직캠_스테이지_코랩.ipynb)의 "앱과 연결" 칸을 실행하면 나오는 주소를 붙여 넣으면,
+              추출을 코랩의 GPU가 해요. 비워 두거나 코랩이 꺼져 있으면 이 기기에서 처리해요.</p>
+          </details>
+
           <label class="check"><input id="with-audio" type="checkbox" checked> 노래 소리도 같이 저장</label>
           <label id="crop-row" class="check" hidden><input id="auto-crop" type="checkbox" checked> <span id="crop-label">검은 테두리 잘라내기</span></label>
 

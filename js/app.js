@@ -4,6 +4,7 @@ import * as sync from './sync.js';
 import * as drive from './drive.js';
 import { GOOGLE_CLIENT_ID } from './config.js';
 import * as pcHelper from './helper.js';
+import * as colab from './colab.js';
 
 const $ = sel => document.querySelector(sel);
 const fmtTime = s => {
@@ -232,6 +233,21 @@ async function importClip(file) {
       id: uid(), name, created: Date.now(), blob: file, thumbnail, layout,
       crop: { x: 0, y: 0, w: 1, h: 1 }, width, height, duration: v.duration, hasAudio: true,
     });
+  } finally {
+    URL.revokeObjectURL(v.src);
+  }
+}
+
+// Thumbnail of a packed clip from its file.
+async function clipThumbnail(blob, layout, width, height) {
+  const v = document.createElement('video');
+  v.muted = true; v.playsInline = true; v.preload = 'auto';
+  v.src = URL.createObjectURL(blob);
+  try {
+    await new Promise((res, rej) => { v.onloadeddata = res; v.onerror = () => rej(new Error('영상을 열 수 없어요')); });
+    v.currentTime = Math.min(1, v.duration / 3);
+    await new Promise(r => { v.onseeked = r; });
+    return await packedThumbnail(v, layout, width, height);
   } finally {
     URL.revokeObjectURL(v.src);
   }
@@ -652,6 +668,26 @@ const faces = {
   },
 };
 
+// Colab GPU address (js/colab.js): saved as typed, with a check that the notebook answers.
+const colabBox = {
+  async check() {
+    const text = $('#colab-url').value.trim(), state = $('#colab-state');
+    if (!text) { state.textContent = ''; return; }
+    if (!colab.parse(text)) { state.textContent = '· 주소 형식이 달라요'; state.className = 'colab-state warn'; return; }
+    state.textContent = '· 확인 중…'; state.className = 'colab-state';
+    const s = await colab.status(text);
+    if ($('#colab-url').value.trim() !== text) return;
+    state.textContent = s ? `· 연결됨${s.gpu ? ` (${s.gpu})` : ''}` : '· 연결 안 됨 (코랩 칸이 실행 중인지 확인해 주세요)';
+    state.className = 'colab-state ' + (s ? 'ok' : 'warn');
+  },
+  show() {
+    $('#colab-url').value = colab.saved();
+    $('#colab-box').open = !!colab.saved();
+    this.check();
+  },
+};
+$('#colab-url').addEventListener('change', () => { colab.save($('#colab-url').value); colabBox.check(); });
+
 $('#faces-input').addEventListener('change', e => {
   const files = [...e.target.files];
   e.target.value = '';
@@ -674,6 +710,7 @@ const create = {
   },
 
   enter() {
+    colabBox.show();
     $('#faces').hidden = !FACE_ENABLED;
     if (FACE_ENABLED) faces.render();
     // "새 클립 만들기" always starts from an empty page, not the last video.
@@ -854,6 +891,27 @@ const create = {
     }
   },
 
+  // The same clip, made on the Colab GPU (js/colab.js): it gets where she was picked (as parts of
+  // the whole frame) and her face, and sends back the finished packed MP4.
+  async extractOnColab(opts, name) {
+    const v = opts.video, r = opts.rect, t = opts.target;
+    const full = ([x, y]) => [(r.x + x * r.w) / v.videoWidth, (r.y + y * r.h) / v.videoHeight];
+    const tap = opts.tap || (t?.bbox ? [(t.bbox[0] + t.bbox[2]) / 2, t.bbox[1] + (t.bbox[3] - t.bbox[1]) * 0.3] : [t.cx, t.cy]);
+    const box = t?.bbox ? [...full([t.bbox[0], t.bbox[1]]), ...full([t.bbox[2], t.bbox[3]])] : null;
+    const { blob, meta } = await colab.extract(opts.file, {
+      name, start: opts.start, end: opts.end, fps: opts.fps, maxSide: opts.maxSide, shape: opts.shape,
+      faceRef: opts.faceRef ? Array.from(opts.faceRef) : null, pick: { tap: full(tap), box },
+    }, {
+      stop: opts.stop, signal: opts.signal,
+      onProgress: info => opts.onProgress(info.stage ? info : { ...info, sam: true, face: !!opts.faceRef, found: true }),
+    });
+    const thumbnail = await clipThumbnail(blob, meta.layout, meta.width, meta.height);
+    return {
+      blob, thumbnail, layout: meta.layout, crop: { x: 0, y: 0, w: 1, h: 1 }, width: meta.width, height: meta.height,
+      fps: opts.fps, duration: meta.duration, hasAudio: true, codec: 'avc1', partial: !!meta.partial,
+    };
+  },
+
   // A start scene where she overlaps someone makes it harder to tell them apart later.
   pickHint() {
     const t = this.target, hint = $('#pick-hint');
@@ -955,7 +1013,8 @@ const create = {
       }
     };
     try {
-      const result = await p.extract(opts);
+      const remote = colab.parse() && await colab.status();
+      const result = remote ? await this.extractOnColab(opts, name) : await p.extract(opts);
       if (runId !== this.runId) return; // cancelled meanwhile
       const clip = { id: uid(), name, created: Date.now(), ...result };
       delete clip.partial;

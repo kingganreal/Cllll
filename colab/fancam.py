@@ -258,8 +258,20 @@ def even(v):
 # ---------------------------------------------------------------------------
 # Main
 
+class Stopped(Exception):
+    pass
+
+
 def make_clip(video, out_dir, name='설윤', photos=(), start=0.0, end=None, fps=30, max_side=1280,
-              shape='cutout', sam_model='base_plus', chunk=300, face_every=0.25, crop=True):
+              shape='cutout', sam_model='base_plus', chunk=300, face_every=0.25, crop=True,
+              ref=None, pick=None, on_progress=None, should_stop=None, cancelled=None):
+    """Makes the clip; returns {'path', 'layout', 'width', 'height', 'duration', 'fixes'}.
+
+    From the app (colab/server.py): `ref` is her face (the registered photos' average embedding,
+    or None to skip face checks), `pick` = {'tap': [x, y], 'box': [x0, y0, x1, y1]} where she was
+    picked on the first frame (0..1 of the whole frame); `on_progress(done, total, stage)` reports,
+    `should_stop()` ends early keeping what's made (여기까지 저장), `cancelled()` aborts.
+    """
     from sam2.build_sam import build_sam2_video_predictor
     import torchvision
 
@@ -271,13 +283,20 @@ def make_clip(video, out_dir, name='설윤', photos=(), start=0.0, end=None, fps
     total = frames.total
     print(f'{vw}x{vh} → {W}x{H}, {end - start:.1f}초, {total}프레임, 장치: {DEVICE}')
 
+    report = on_progress or (lambda done, total, stage=None: None)
+    report(0, total, '모델 준비 중')
     faces = Faces()
-    ref = reference_from_photos(faces, photos) if photos else None
-    if ref is None:
+    if ref is not None:
+        ref = np.asarray(ref, np.float32)
+        ref = ref / np.linalg.norm(ref)
+    elif photos:
+        ref = reference_from_photos(faces, photos)
+    if ref is None and pick is None:
         ref = reference_from_video(faces, video)
-    if ref is None:
-        raise RuntimeError('영상에서 얼굴을 찾지 못했어요. 설윤 사진을 넣어 주세요.')
-    her_face = Matcher(ref)
+        if ref is None:
+            raise RuntimeError('영상에서 얼굴을 찾지 못했어요. 설윤 사진을 넣어 주세요.')
+    # Picked in the app without registered photos: follow that pick, no face checks.
+    her_face = Matcher(ref) if ref is not None else None
 
     people = torchvision.models.detection.fasterrcnn_resnet50_fpn_v2(weights='DEFAULT').to(DEVICE).eval()
 
@@ -294,6 +313,8 @@ def make_clip(video, out_dir, name='설윤', photos=(), start=0.0, end=None, fps
 
     def look(bgr):
         found = faces(bgr)
+        if her_face is None:
+            return found, None
         return found, her_face.find(found, lambda f: near_middle(f) or f['sim'] >= 0.55)
 
     def prompt_from_face(bgr, her, found):
@@ -312,9 +333,19 @@ def make_clip(video, out_dir, name='설윤', photos=(), start=0.0, end=None, fps
                 pts.append([(f['box'][0] + f['box'][2]) / 2, (f['box'][1] + f['box'][3]) / 2]); labels.append(0)
         return np.array(pts, np.float32), np.array(labels, np.int32), (np.array(box, np.float32) if box is not None else None)
 
-    # Find her at the start (or up to 3 s in, where her face shows).
+    # Find her at the start (or up to 3 s in, where her face shows) - unless she was picked in the app.
     first = None
-    for i in range(0, min(total, int(3 * fps) + 1), max(1, int(fps / 2))):
+    if pick is not None:
+        tx, ty = pick['tap'][0] * vw, pick['tap'][1] * vh
+        pts, labels = [[tx * s, ty * s]], [1]
+        box = None
+        if pick.get('box'):
+            b = pick['box']
+            pad = 0.02
+            box = np.array([max(0, b[0] - pad) * W, max(0, b[1] - pad) * H, min(1, b[2] + pad) * W, min(1, b[3] + pad) * H], np.float32)
+        first = (0, None, None)
+        prompt = ('points', (np.array(pts, np.float32), np.array(labels, np.int32), box))
+    for i in range(0, min(total, int(3 * fps) + 1) if pick is None else 0, max(1, int(fps / 2))):
         found, her = look(frames.get(i))
         if her is not None:
             first = (i, her, found)
@@ -324,7 +355,8 @@ def make_clip(video, out_dir, name='설윤', photos=(), start=0.0, end=None, fps
     skip, her, found = first
     if skip:
         print(f'처음 {skip / fps:.1f}초는 얼굴이 안 보여서 거기서부터 시작해요.')
-    prompt = ('points', prompt_from_face(frames.get(skip), her, found))
+    if pick is None:
+        prompt = ('points', prompt_from_face(frames.get(skip), her, found))
 
     # Matting model
     rvm = torch.hub.load('PeterL1n/RobustVideoMatting', 'resnet50' if DEVICE == 'cuda' else 'mobilenetv3', trust_repo=True).to(DEVICE).eval()
@@ -419,7 +451,12 @@ def make_clip(video, out_dir, name='설윤', photos=(), start=0.0, end=None, fps
     off_face, last_her, doubted = 0, None, False
     from tqdm.auto import tqdm
     bar = tqdm(total=total - skip, unit='프레임')
-    while i0 < total:
+    report(skip, total, None)
+    stopped = False
+    while i0 < total and not stopped:
+        if cancelled and cancelled():
+            ff.stdin.close(); ff.wait()
+            raise Stopped('취소됐어요')
         i1 = min(total, i0 + chunk)
         shutil.rmtree(jdir, ignore_errors=True)
         os.makedirs(jdir)
@@ -446,7 +483,7 @@ def make_clip(video, out_dir, name='설윤', photos=(), start=0.0, end=None, fps
         for k in range(i1 - i0):
             i = i0 + k
             if i % every == 0:
-                found, her = look(frames.get(i))
+                found, her = look(frames.get(i)) if her_face is not None else ([], None)
                 core = masks.get(k)
                 in_mask = lambda f: core is not None and np.mean([core[int(min(H - 1, max(0, y))), int(min(W - 1, max(0, x)))] for x, y in f['kps'][:3]]) >= 0.6
                 strangers = [f for f in found if f is not her and her_face.other(f) and frontal(f) and f['size'] > max(W, H) * 0.024 and in_mask(f)]
@@ -470,12 +507,17 @@ def make_clip(video, out_dir, name='설윤', photos=(), start=0.0, end=None, fps
                     doubted = False
             hidden[k] = hide
         for k in range(stop):
+            if should_stop and should_stop() and i0 + k > skip:
+                stop, stopped = k, True
+                break
             write(i0 + k, masks.get(k), hidden[k])
             bar.update(1)
+            report(i0 + k + 1, total, None)
         last_mask = masks.get(stop - 1) if stop > 0 else None
         prompt = next_prompt or (('mask', last_mask) if last_mask is not None and last_mask.any() else prompt)
         frames.forget_before(i0 + stop)
         i0 += stop if stop > 0 else 1
+    written = min(i0, total) - skip
     bar.close()
     ff.stdin.close()
     ff.wait()
@@ -501,7 +543,12 @@ def make_clip(video, out_dir, name='설윤', photos=(), start=0.0, end=None, fps
     else:
         os.replace(tmp_out, final)
     print('완성:', final)
-    return final
+    cap = cv2.VideoCapture(final)
+    fw, fh = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+    return {'path': final, 'layout': layout, 'width': fw // 2 if layout == 'sbs' else fw,
+            'height': fh if layout == 'sbs' else fh // 2, 'duration': written / fps, 'fixes': fixes,
+            'partial': written < total - skip}
 
 
 def download_youtube(url, out_dir):

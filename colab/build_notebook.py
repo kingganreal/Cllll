@@ -5,6 +5,7 @@ import os
 
 here = os.path.dirname(os.path.abspath(__file__))
 code = open(os.path.join(here, 'fancam.py'), encoding='utf8').read()
+server = open(os.path.join(here, 'server.py'), encoding='utf8').read()
 
 
 def md(text):
@@ -63,7 +64,21 @@ OUT_FOLDER = '/content/drive/MyDrive/직캠 스테이지/코랩'
 """, form=True),
     md('## 4. 처리 코드'),
     py('%%writefile /content/fancam.py\n' + code),
-    md('## 5. 실행\n\n처리하는 동안 이 탭을 열어 두세요. 진행 막대가 보여요.'),
+    py('%%writefile /content/server.py\n' + server),
+    md("""
+## 5-A. 앱과 연결해서 쓰기 (추천)
+
+이 칸을 실행하면 주소가 하나 나와요. 앱의 **만들기 → 코랩 GPU로 처리**에 붙여 넣으면,
+앱에서 평소처럼 영상 고르기·멤버 고르기를 하고 **추출 시작**만 누르면 코랩 GPU가 처리해요. (위 3번 설정 칸은 안 써도 돼요.)
+이 탭을 열어 둔 동안 쓸 수 있고, 코랩을 다시 켜면 주소가 바뀌어요.
+"""),
+    py("""
+import sys
+sys.path.insert(0, '/content')
+import server
+server.serve()
+"""),
+    md('## 5-B. 앱 없이 여기서 바로 실행\n\n3번 설정대로 처리해요. 처리하는 동안 이 탭을 열어 두세요.'),
     py("""
 import glob, importlib, sys
 sys.path.insert(0, '/content')
