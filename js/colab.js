@@ -95,7 +95,17 @@ async function run(file, params, { onProgress, stop, signal }) {
     onProgress?.({ stage: '완성된 클립 받는 중' });
     const res = await call(`/jobs/${id}/result`);
     const meta = JSON.parse(res.headers.get('X-Clip') || '{}');
-    const blob = new Blob([await res.arrayBuffer()], { type: 'video/mp4' });
+    // Read it in pieces so the screen can show how far along it is.
+    const size = Number(res.headers.get('Content-Length')) || 0, reader = res.body.getReader(), parts = [];
+    let got = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      parts.push(value);
+      got += value.byteLength;
+      if (size) onProgress?.({ stage: `완성된 클립 받는 중 ${Math.round(got / size * 100)}% (${(size / 1048576).toFixed(0)}MB)` });
+    }
+    const blob = new Blob(parts, { type: 'video/mp4' });
     call(`/jobs/${id}`, { method: 'DELETE' }).catch(() => {}); // free the server's disk
     return { blob, meta };
   } finally {

@@ -407,7 +407,7 @@ def make_clip(video, out_dir, name='설윤', photos=(), start=0.0, end=None, fps
         'ffmpeg', '-y', '-loglevel', 'error',
         '-f', 'rawvideo', '-pix_fmt', 'bgr24', '-s', f'{PW}x{PH}', '-r', str(fps), '-i', '-',
         '-ss', f'{first_t:.3f}', '-t', f'{end - first_t:.3f}', '-i', video,
-        '-map', '0:v', '-map', '1:a?', '-c:v', 'libx264', '-crf', '17', '-preset', 'medium', '-pix_fmt', 'yuv420p',
+        '-map', '0:v', '-map', '1:a?', '-c:v', 'libx264', '-crf', '20', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
         '-c:a', 'aac', '-b:a', '192k', '-shortest', '-movflags', '+faststart', tmp_out,
     ], stdin=subprocess.PIPE)
 
@@ -504,6 +504,9 @@ def make_clip(video, out_dir, name='설윤', photos=(), start=0.0, end=None, fps
                                                 box=box * sam_scale if box is not None else None)
             masks = {}
             for fidx, _, logits in predictor.propagate_in_video(state):
+                # tracking is the first half of each chunk's work, writing the second
+                if fidx % 10 == 0:
+                    report(i0 + (fidx + 1) // 2, total, None)
                 masks[fidx] = cv2.resize(logits[0, 0].float().cpu().numpy(), (W, H), interpolation=cv2.INTER_LINEAR) > 0
             predictor.reset_state(state)
 
@@ -543,7 +546,7 @@ def make_clip(video, out_dir, name='설윤', photos=(), start=0.0, end=None, fps
                 break
             write(i0 + k, masks.get(k), hidden[k])
             bar.update(1)
-            report(i0 + k + 1, total, None)
+            report(i0 + (stop + k + 1) // 2, total, None)
         last_mask = masks.get(stop - 1) if stop > 0 else None
         prompt = next_prompt or (('mask', last_mask) if last_mask is not None and last_mask.any() else prompt)
         frames.forget_before(i0 + stop)
@@ -568,7 +571,7 @@ def make_clip(video, out_dir, name='설윤', photos=(), start=0.0, end=None, fps
         else:
             fc = f'[0:v]split[a][b];[a]crop={cw}:{ch}:{cx}:{cy}[c];[b]crop={cw}:{ch}:{cx}:{oh + cy}[d];[c][d]vstack[v]'
         subprocess.run(['ffmpeg', '-y', '-loglevel', 'error', '-i', tmp_out, '-filter_complex', fc, '-map', '[v]', '-map', '0:a?',
-                        '-c:v', 'libx264', '-crf', '17', '-preset', 'medium', '-pix_fmt', 'yuv420p', '-c:a', 'copy',
+                        '-c:v', 'libx264', '-crf', '20', '-preset', 'veryfast', '-pix_fmt', 'yuv420p', '-c:a', 'copy',
                         '-movflags', '+faststart', final], check=True)
         os.remove(tmp_out)
     else:
@@ -583,10 +586,10 @@ def make_clip(video, out_dir, name='설윤', photos=(), start=0.0, end=None, fps
 
 
 def download_youtube(url, out_dir):
-    """Best quality up to 4K (the app's analysis stops at its own size anyway)."""
+    """Up to 1080p: processing works at 1920 at most, and decoding 4K on Colab's two CPU cores is slow."""
     os.makedirs(out_dir, exist_ok=True)
     out = os.path.join(out_dir, '%(title).80s.%(ext)s')
-    r = subprocess.run(['yt-dlp', '-f', 'bv*[height<=2160]+ba/b', '--merge-output-format', 'mp4', '-o', out,
+    r = subprocess.run(['yt-dlp', '-f', 'bv*[height<=1080]+ba/b', '--merge-output-format', 'mp4', '-o', out,
                         '--print', 'after_move:filepath', url], check=True, capture_output=True, text=True)
     return r.stdout.strip().splitlines()[-1]
 
