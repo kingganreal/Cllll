@@ -709,6 +709,8 @@ export async function extract(o) {
   o.onProgress?.({ done: 0, total: 1, elapsed: 0, eta: 0, stage: '준비 중' });
   // The GPU models run in a worker that is shut down if the GPU hangs (see js/gpu.js); whatever
   // fails falls back to the CPU tools below.
+  // The circle only follows where she is (SAM's mask), so it doesn't need the matting model.
+  if (o.shape === 'circle') o = { ...o, useMatting: false };
   let gpu = (o.useMatting !== false || o.useSam !== false || o.faceRef) && await webgpuAvailable() ? gpuWorker() : null;
   const configure = () => gpu.call('config', [{ samEp: globalThis.__FANCAM_SAM_EP__, recent: globalThis.__FANCAM_SAM_RECENT__ }]).catch(() => {});
   if (gpu) {

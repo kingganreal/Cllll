@@ -59,7 +59,7 @@ END = 0  #@param {type:"number"}
 SHAPE = '누끼'  #@param ["누끼", "원"]
 QUALITY = '고화질 (긴 변 1280)'  #@param ["보통 (긴 변 960)", "고화질 (긴 변 1280)", "FHD (긴 변 1920)"]
 FPS = 30  #@param [24, 30, 60] {type:"raw"}
-SAM_MODEL = 'base_plus'  #@param ["tiny", "small", "base_plus", "large"]
+SAM_MODEL = 'auto'  #@param ["auto", "tiny", "small", "base_plus", "large"]
 OUT_FOLDER = '/content/drive/MyDrive/직캠 스테이지/코랩'
 """, form=True),
     md('## 4. 처리 코드'),

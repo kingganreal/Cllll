@@ -64,7 +64,7 @@ def worker():
             r = fancam.make_clip(
                 src, job['dir'], name=p.get('name') or '클립', start=float(p.get('start', 0)), end=p.get('end'),
                 fps=int(p.get('fps', 30)), max_side=int(p.get('maxSide', 1280)), shape=p.get('shape', 'cutout'),
-                sam_model=p.get('sam') or os.environ.get('FANCAM_SAM', 'base_plus'), ref=p.get('faceRef'), pick=p.get('pick'),
+                sam_model=p.get('sam') or os.environ.get('FANCAM_SAM', 'auto'), ref=p.get('faceRef'), pick=p.get('pick'),
                 on_progress=progress, should_stop=lambda: job['stop'], cancelled=lambda: job['state'] == 'cancelled')
             job['result'] = r
             job['state'] = 'done'

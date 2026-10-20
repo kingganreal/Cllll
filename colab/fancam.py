@@ -283,7 +283,7 @@ class Stopped(Exception):
 
 
 def make_clip(video, out_dir, name='설윤', photos=(), start=0.0, end=None, fps=30, max_side=1280,
-              shape='cutout', sam_model='base_plus', chunk=300, face_every=0.25, crop=True,
+              shape='cutout', sam_model='auto', chunk=300, face_every=0.25, crop=True,
               ref=None, pick=None, on_progress=None, should_stop=None, cancelled=None):
     """Makes the clip; returns {'path', 'layout', 'width', 'height', 'duration', 'fixes'}.
 
@@ -379,10 +379,15 @@ def make_clip(video, out_dir, name='설윤', photos=(), start=0.0, end=None, fps
         prompt = ('points', prompt_from_face(frames.get(skip), her, found))
 
     # Matting model
-    rvm = torch.hub.load('PeterL1n/RobustVideoMatting', 'resnet50' if DEVICE == 'cuda' else 'mobilenetv3', trust_repo=True).to(DEVICE).eval()
+    # Matting model: only the cut-out needs her edges; the circle just follows SAM's mask.
+    rvm = None if shape == 'circle' else torch.hub.load('PeterL1n/RobustVideoMatting', 'resnet50' if DEVICE == 'cuda' else 'mobilenetv3', trust_repo=True).to(DEVICE).eval()
     rec = [None] * 4
     ratio = min(1.0, 512 / max(W, H))
 
+    if sam_model == 'auto':
+        # base+ where the GPU has bfloat16 (A100, L4); on a T4 (float32 only) small is about twice
+        # as fast and follows her just as well.
+        sam_model = 'base_plus' if BF16 else 'small'
     cfg, url = SAM_MODELS[sam_model]
     predictor = build_sam2_video_predictor(cfg, fetch(url), device=DEVICE)
 
@@ -420,12 +425,17 @@ def make_clip(video, out_dir, name='설윤', photos=(), start=0.0, end=None, fps
     def write(i, core, hidden):
         nonlocal rec, cam
         bgr = frames.get(i)
-        with torch.no_grad():
-            src = torch.from_numpy(bgr[:, :, ::-1].copy()).permute(2, 0, 1)[None].float().div(255).to(DEVICE)
-            _, pha, *rec = rvm(src, *rec, downsample_ratio=ratio)
-        pha = pha[0, 0].float().cpu().numpy()
+        if rvm is not None:
+            with torch.no_grad():
+                src = torch.from_numpy(bgr[:, :, ::-1].copy()).permute(2, 0, 1)[None].float().div(255).to(DEVICE)
+                _, pha, *rec = rvm(src, *rec, downsample_ratio=ratio)
+            pha = pha[0, 0].float().cpu().numpy()
+        else:
+            pha = None
         if hidden or core is None:
             a = np.zeros((H, W), np.float32)
+        elif pha is None:
+            a = core.astype(np.float32)
         else:
             m = core.astype(np.uint8)
             area = cv2.GaussianBlur(cv2.dilate(m, k_area).astype(np.float32), (0, 0), side_px * 0.004)
