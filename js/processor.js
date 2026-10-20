@@ -656,7 +656,11 @@ export async function extract(o) {
 
   const r = o.rect ?? fullRect(video);
   const [aw, ah] = analysisSize(r, o.maxSide);
-  const [hw, hh] = fitSize(r.w, r.h, o.maxSide);
+  // Circle mode: a round window that follows her, so the clip is a square picture with a round
+  // alpha instead of her outline. (Her cut-out is still made, to know where she is.)
+  const circle = o.shape === 'circle';
+  const side = Math.max(64, Math.round(Math.min(o.maxSide, 1080, r.w, r.h) / 16) * 16);
+  const [hw, hh] = circle ? [side, side] : fitSize(r.w, r.h, o.maxSide);
   // Portrait fancams pack side-by-side, landscape ones top/bottom, keeping frames squarish.
   const layout = hh >= hw ? 'sbs' : 'tb';
   const W = layout === 'sbs' ? hw * 2 : hw;
@@ -882,6 +886,70 @@ export async function extract(o) {
     let offFace = 0; // face checks in a row where the tracker's mask missed her face
 
     const bounds = [1, 1, 0, 0];
+
+    // Circle mode: follow the middle of her cut-out (upper body weighs more than legs, so the
+    // circle sits around her torso) with a radius fitted to her size, both eased so the window
+    // glides instead of jittering. When she's not found for a moment it stays put, then fades.
+    let cam = null, camAlpha = 0, lostFor = 0;
+    let disk = null;
+    const composeCircle = (f, found) => {
+      let x0 = aw, y0 = ah, x1 = -1, y1 = -1, sx = 0, sy = 0, sw = 0;
+      for (let y = 0; y < ah; y += 2) {
+        for (let x = 0; x < aw; x += 2) {
+          const a = alpha[y * aw + x];
+          if (a > 0.5) {
+            if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+            sx += x * a; sy += y * a; sw += a;
+          }
+        }
+      }
+      const seen = found && sw > 20;
+      if (seen) {
+        // In source pixels: the box's middle across, a bit above the middle down (her face and
+        // torso, not her feet), and a radius that fits most of her.
+        const bw = (x1 - x0) / aw * r.w, bh = (y1 - y0) / ah * r.h;
+        const want = {
+          x: (sx / sw) / aw * r.w,
+          y: (y0 / ah + (y1 - y0) / ah * 0.42) * r.h,
+          rad: Math.max(bw * 0.7, bh * 0.55, Math.min(r.w, r.h) * 0.12),
+        };
+        want.rad = Math.min(want.rad, Math.min(r.w, r.h) / 2);
+        if (!cam) cam = { ...want };
+        else {
+          cam.x += (want.x - cam.x) * 0.2;
+          cam.y += (want.y - cam.y) * 0.2;
+          cam.rad += (want.rad - cam.rad) * 0.08;
+        }
+        lostFor = 0;
+      } else lostFor++;
+      camAlpha += ((cam && lostFor <= fps ? 1 : 0) - camAlpha) * 0.15;
+
+      oCtx.fillStyle = '#000';
+      oCtx.fillRect(0, 0, W, H);
+      if (cam) {
+        // Keep the window inside the picture (no black edge where it would run off it).
+        const rad = cam.rad, d = rad * 2;
+        const x = Math.min(Math.max(cam.x, rad), r.w - rad), y = Math.min(Math.max(cam.y, rad), r.h - rad);
+        f.draw(oCtx, { x: r.x + x - rad, y: r.y + y - rad, w: d, h: d }, hw, hh);
+      }
+      if (!disk) {
+        disk = document.createElement('canvas');
+        disk.width = hw; disk.height = hh;
+        const g = disk.getContext('2d');
+        const grad = g.createRadialGradient(hw / 2, hh / 2, hw / 2 - Math.max(2, hw / 160), hw / 2, hh / 2, hw / 2);
+        grad.addColorStop(0, '#fff');
+        grad.addColorStop(1, '#000');
+        g.fillStyle = '#000';
+        g.fillRect(0, 0, hw, hh);
+        g.fillStyle = grad;
+        g.beginPath(); g.arc(hw / 2, hh / 2, hw / 2, 0, Math.PI * 2); g.fill();
+        g.fillStyle = '#fff';
+        g.beginPath(); g.arc(hw / 2, hh / 2, hw / 2 - Math.max(2, hw / 160), 0, Math.PI * 2); g.fill();
+      }
+      oCtx.globalAlpha = camAlpha;
+      oCtx.drawImage(disk, alphaX, alphaY);
+      oCtx.globalAlpha = 1;
+    };
     let thumbnail = null, found = true;
     const t0 = performance.now();
     let total = Math.max(1, Math.floor((end - start) * fps));
@@ -1122,6 +1190,10 @@ export async function extract(o) {
           }
         }
 
+        if (circle) {
+          composeCircle(f, found);
+          mark('compose');
+        } else {
         // Track the overall bounding box so the player can crop empty space.
         for (let y = 0; y < ah; y += 2) {
           for (let x = 0; x < aw; x += 2) {
@@ -1144,6 +1216,7 @@ export async function extract(o) {
         oCtx.drawImage(mCanvas, alphaX, alphaY, hw, hh);
 
         mark('compose');
+        }
         const frame = new VideoFrame(out, { timestamp: Math.round(i * 1e6 / fps), duration: Math.round(1e6 / fps) });
         encoder.encode(frame, { keyFrame: i % fps === 0 });
         encoded++;
@@ -1186,7 +1259,7 @@ export async function extract(o) {
 
     // Pad the crop a little and fall back to the full frame if she was never found.
     const pad = 0.03;
-    const crop = bounds[2] > bounds[0]
+    const crop = circle ? { x: 0, y: 0, w: 1, h: 1 } : bounds[2] > bounds[0]
       ? { x: Math.max(0, bounds[0] - pad), y: Math.max(0, bounds[1] - pad),
           w: Math.min(1, bounds[2] + pad + 2 / aw) - Math.max(0, bounds[0] - pad),
           h: Math.min(1, bounds[3] + pad + 2 / ah) - Math.max(0, bounds[1] - pad) }

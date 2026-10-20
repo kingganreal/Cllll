@@ -920,7 +920,7 @@ const create = {
       file: this.file, video: v, start: this.start, end: this.end, target: this.target, rect: this.rect(),
       tap: this.tap, others: this.persons, stop: (this.stopFlag = { requested: false }),
       useSam: SAM_ENABLED, faceRef: await faces.reference(), faceSeed: this.tapped ? null : this.faceSeed,
-      fps: Number($('#fps').value), maxSide: Number($('#quality').value),
+      fps: Number($('#fps').value), maxSide: Number($('#quality').value), shape: $('#shape').value,
       withAudio: $('#with-audio').checked,
     };
     // ~3.7 Mbps at 960, ~6.5 at 1280, ~15 at 1920 (30fps): the cut-out's edges need the bits.
