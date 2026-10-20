@@ -1,13 +1,29 @@
-// Clips sent from the web app, and the characters on the desktop, kept in the user's app-data folder.
+// Clips sent from the web app, kept as files in 문서\직캠 스테이지 (the web app backs every clip up
+// here and takes them back if the browser's copy is gone), and the characters on the desktop
+// (kept in the app-data folder).
 const fs = require('fs');
 const path = require('path');
 const { app } = require('electron');
 
 const root = () => app.getPath('userData');
-const clipsDir = () => path.join(root(), 'clips');
+const clipsDir = () => path.join(app.getPath('documents'), '직캠 스테이지');
+const oldClipsDir = () => path.join(root(), 'clips'); // before 0.1.2
 const stateFile = () => path.join(root(), 'state.json');
 
-function ensureDirs() { fs.mkdirSync(clipsDir(), { recursive: true }); }
+let moved = false;
+function ensureDirs() {
+  fs.mkdirSync(clipsDir(), { recursive: true });
+  if (moved) return;
+  moved = true;
+  // Bring clips over from where older versions kept them.
+  try {
+    for (const f of fs.readdirSync(oldClipsDir())) {
+      const to = path.join(clipsDir(), f);
+      if (!fs.existsSync(to)) fs.copyFileSync(path.join(oldClipsDir(), f), to);
+    }
+    fs.rmSync(oldClipsDir(), { recursive: true, force: true });
+  } catch {}
+}
 
 const clipPath = (id, ext) => path.join(clipsDir(), `${id}.${ext}`);
 const safeId = id => /^[\w-]{1,64}$/.test(id || '');

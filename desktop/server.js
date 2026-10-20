@@ -1,9 +1,11 @@
 // Local server on http://localhost:8790 for the web app (open in Chrome on the same PC):
 //   /status                         is the app running?
 //   /download /job /file /done      YouTube originals through yt-dlp (see ytdlp.js)
-//   PUT /clips/<id>?meta=<json>     receive a clip (body: packed MP4)
+//   PUT /clips/<id>?meta=<json>     receive a clip (body: packed MP4), kept as a file
 //   PUT /clips/<id>/thumb           receive its thumbnail (body: PNG)
 //   POST /clips/<id>/show           put it on the desktop
+//   GET /clips                      every clip kept here (details)
+//   GET /clips/<id>/video, /thumb   a clip's files, to restore it into the web app
 const http = require('http');
 const fs = require('fs');
 const { pipeline } = require('stream/promises');
@@ -81,6 +83,7 @@ function start({ appVersion, onClipsChanged, onShow }) {
           id: clipId, name: String(meta.name || '클립'), layout: meta.layout === 'tb' ? 'tb' : 'sbs',
           crop: meta.crop || { x: 0, y: 0, w: 1, h: 1 }, width: Number(meta.width) || 0, height: Number(meta.height) || 0,
           duration: Number(meta.duration) || 0, hasAudio: !!meta.hasAudio, received: Date.now(),
+          created: Number(meta.created) || Date.now(), fps: Number(meta.fps) || 0, codec: String(meta.codec || ''),
         });
         onClipsChanged();
         return send(200, { ok: true });
@@ -96,7 +99,13 @@ function start({ appVersion, onClipsChanged, onShow }) {
         return send(200, { ok: true });
       }
       if (p === '/clips' && req.method === 'GET') {
-        return send(200, { clips: store.listClips().map(c => ({ id: c.id, name: c.name })) });
+        return send(200, { clips: store.listClips() });
+      }
+      if ((m = p.match(/^\/clips\/([\w-]{1,64})\/(video|thumb)$/)) && req.method === 'GET') {
+        const file = store.clipPath(m[1], m[2] === 'video' ? 'mp4' : 'png');
+        if (!store.getClip(m[1]) || !fs.existsSync(file)) return send(404, { error: '파일이 없어요.' });
+        res.writeHead(200, { 'Content-Type': m[2] === 'video' ? 'video/mp4' : 'image/png', 'Content-Length': fs.statSync(file).size });
+        return pipeline(fs.createReadStream(file), res).catch(() => {});
       }
       return send(404, { error: 'not found' });
     } catch (err) {

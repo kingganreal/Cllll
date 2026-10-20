@@ -49,15 +49,35 @@ function put(path, body, onProgress) {
   });
 }
 
-// Sends a clip to the Windows app and puts it on the desktop.
-export async function sendToDesktop(clip, onProgress) {
+// Gives a clip to the Windows app, which keeps it as a file (in 문서\직캠 스테이지).
+export async function backupClip(clip, onProgress) {
   const meta = {
     name: clip.name, layout: clip.layout, crop: clip.crop, width: clip.width, height: clip.height,
-    duration: clip.duration, hasAudio: clip.hasAudio,
+    duration: clip.duration, hasAudio: clip.hasAudio, created: clip.created, fps: clip.fps, codec: clip.codec,
   };
   await put(`/clips/${encodeURIComponent(clip.id)}?meta=${encodeURIComponent(JSON.stringify(meta))}`, clip.blob, onProgress);
   if (clip.thumbnail) await put(`/clips/${encodeURIComponent(clip.id)}/thumb`, clip.thumbnail);
+}
+
+// Sends a clip to the Windows app and puts it on the desktop.
+export async function sendToDesktop(clip, onProgress) {
+  await backupClip(clip, onProgress);
   await call(`/clips/${encodeURIComponent(clip.id)}/show`, { method: 'POST', body: '{}' });
+}
+
+/** The clips the Windows app keeps (details only). */
+export const listBackups = () => call('/clips').then(r => r.clips || []);
+
+/** A kept clip as a library record, with its video and thumbnail. */
+export async function fetchBackup(meta) {
+  const get = async (what, type) => {
+    const res = await fetch(`${BASE}/clips/${encodeURIComponent(meta.id)}/${what}`, { cache: 'no-store' });
+    return res.ok ? new Blob([await res.arrayBuffer()], { type }) : null;
+  };
+  const blob = await get('video', 'video/mp4');
+  if (!blob) throw new Error('윈도우 앱에서 클립을 가져오지 못했어요.');
+  const { received, ...rest } = meta;
+  return { ...rest, created: meta.created || received || Date.now(), blob, thumbnail: await get('thumb', 'image/png') };
 }
 
 export const startDownload = url => call('/download', {

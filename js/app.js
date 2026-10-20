@@ -257,6 +257,53 @@ function packedThumbnail(v, layout, width, height) {
 // Cloud sync across phone / tablet / computer through Google Drive (see js/drive.js).
 // Clips synced earlier through GitHub (js/sync.js) are moved over once.
 
+// ---------------------------------------------------------------------------
+// Backup on this PC: with the Windows app running, every clip is also kept as a file in
+// 문서\직캠 스테이지, so clearing the browser doesn't lose it. Clips there that this browser has
+// never had (it was cleared, or it's another browser) come back into the library; ones deleted
+// here stay deleted.
+
+const BACKUP_SEEN = 'fancam-pc-backup-seen';
+const pcBackup = {
+  running: false,
+  again: false,
+
+  async run() {
+    if (this.running) { this.again = true; return; }
+    if (!(await pcHelper.desktopRunning())) return;
+    this.running = true;
+    try {
+      let seen;
+      try { seen = new Set(JSON.parse(localStorage.getItem(BACKUP_SEEN)) || []); } catch { seen = new Set(); }
+      const mine = await clips.all();
+      const kept = await pcHelper.listBackups();
+      const there = new Set(kept.map(c => c.id));
+      const here = new Set(mine.map(c => c.id));
+      for (const c of mine) {
+        if (!there.has(c.id) && c.blob) await pcHelper.backupClip(c);
+        seen.add(c.id);
+      }
+      let restored = 0;
+      for (const meta of kept) {
+        if (here.has(meta.id) || seen.has(meta.id)) continue;
+        await clips.put(await pcHelper.fetchBackup(meta));
+        seen.add(meta.id);
+        restored++;
+      }
+      try { localStorage.setItem(BACKUP_SEEN, JSON.stringify([...seen])); } catch {}
+      if (restored) {
+        toast(`PC에 저장된 클립 ${restored}개를 다시 불러왔어요.`, 3500);
+        if (current === 'library') library.render();
+      }
+    } catch (err) {
+      console.warn('PC backup failed', err);
+    } finally {
+      this.running = false;
+      if (this.again) { this.again = false; this.run(); }
+    }
+  },
+};
+
 const cloud = {
   running: false,
   again: false,
@@ -265,6 +312,7 @@ const cloud = {
   get on() { return drive.isEnabled(); },
 
   kick() {
+    pcBackup.run();
     if (!this.on) return;
     if (!drive.hasToken()) { this.askSignIn(); return; }
     if (this.running) { this.again = true; return; }
@@ -1712,4 +1760,5 @@ if (location.hash.startsWith('#gdrive=')) {
   }
 }
 go(location.hash.slice(1) || 'library');
+pcBackup.run();
 cloud.kick();

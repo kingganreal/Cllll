@@ -240,6 +240,7 @@ function refreshTray() {
     { label: '직캠 스테이지 열기', click: showManager },
     { label: hidden ? '캐릭터 모두 보이기' : '캐릭터 모두 숨기기', click: () => setHidden(!hidden) },
     { label: '웹앱 열기 (클립 만들기)', click: () => shell.openExternal(WEB_APP_URL) },
+    { label: '클립 폴더 열기', click: () => { store.ensureDirs(); shell.openPath(store.clipsDir()); } },
     { type: 'separator' },
     { label: '끝내기', click: () => { quitting = true; app.quit(); } },
   ]));
