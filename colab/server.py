@@ -4,7 +4,7 @@ Runs in the Colab notebook next to fancam.py; cloudflared gives it a public http
 goes into the app together with a random key (every request must carry it). One job at a time.
 
   GET  /status                         is it up? (GPU name)
-  POST /jobs            JSON params    new job -> {id}
+  POST /jobs            JSON params    new job -> {id} (with params.url the server downloads the video)
   PUT  /jobs/<id>/part?i=N   bytes     the video, in pieces (a quick tunnel takes 100 MB at most)
   POST /jobs/<id>/start                all pieces are in: queue it
   GET  /jobs/<id>                      {state, done, total, stage, error}
@@ -41,12 +41,22 @@ def worker():
         job['state'] = 'running'
         try:
             p = job['params']
-            src = os.path.join(job['dir'], 'source')
-            with open(src, 'wb') as out:
-                for i in range(job['parts']):
-                    with open(os.path.join(job['dir'], f'part{i}'), 'rb') as f:
-                        shutil.copyfileobj(f, out)
-                    os.remove(os.path.join(job['dir'], f'part{i}'))
+            if p.get('url'):
+                job['state'] = 'downloading'
+                try:
+                    src = fancam.download_youtube(p['url'], job['dir'])
+                except Exception as err:
+                    # YouTube often refuses data-centre addresses; the app then sends the file itself.
+                    job['state'], job['error'] = 'error', 'download: ' + (getattr(err, 'stderr', None) or str(err))[-300:]
+                    continue
+                job['state'] = 'running'
+            else:
+                src = os.path.join(job['dir'], 'source')
+                with open(src, 'wb') as out:
+                    for i in range(job['parts']):
+                        with open(os.path.join(job['dir'], f'part{i}'), 'rb') as f:
+                            shutil.copyfileobj(f, out)
+                        os.remove(os.path.join(job['dir'], f'part{i}'))
 
             def progress(done, total, stage=None):
                 job.update(done=done, total=total, stage=stage)

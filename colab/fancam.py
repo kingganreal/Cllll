@@ -251,6 +251,26 @@ def probe(path):
     return w, h, n / fps
 
 
+def drop_strays(a, near_kernel):
+    """Pieces of the matte floating away from her (a neighbour's raised arm): keep her body (the
+    biggest piece), what's near it, and other big pieces; faint edge pixels stay near her body."""
+    n, lab, st, _ = cv2.connectedComponentsWithStats((a >= 0.3).astype(np.uint8), connectivity=4)
+    if n <= 2:
+        return a
+    areas = st[1:, cv2.CC_STAT_AREA]
+    best = 1 + int(np.argmax(areas))
+    near = cv2.dilate((lab == best).astype(np.uint8), near_kernel) > 0
+    keep = np.zeros(n, bool)
+    keep[best] = True
+    keep[np.unique(lab[near])] = True
+    keep[1:][areas > areas.max() * 0.25] = True
+    keep[0] = False
+    drop = np.where(lab > 0, ~keep[lab], ~near)
+    a = a.copy()
+    a[drop] = 0
+    return a
+
+
 def even(v):
     return max(2, int(round(v / 2)) * 2)
 
@@ -412,6 +432,7 @@ def make_clip(video, out_dir, name='설윤', photos=(), start=0.0, end=None, fps
             inner = cv2.erode(m, k_inner).astype(np.float32)
             a = np.maximum(pha * area, inner)
             a = np.clip((a - 0.1) / 0.85, 0, 1)
+            a = drop_strays(a, k_area)
         if shape == 'circle':
             ys, xs = np.nonzero(a[::2, ::2] > 0.5)
             if len(xs) > 20:

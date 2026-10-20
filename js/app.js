@@ -686,6 +686,7 @@ const colabBox = {
     this.check();
   },
 };
+$('#shape').addEventListener('change', () => { try { localStorage.setItem('fancam-shape', $('#shape').value); } catch {} });
 $('#colab-url').addEventListener('change', () => { colab.save($('#colab-url').value); colabBox.check(); });
 
 $('#faces-input').addEventListener('change', e => {
@@ -711,6 +712,7 @@ const create = {
 
   enter() {
     colabBox.show();
+    try { $('#shape').value = localStorage.getItem('fancam-shape') || 'cutout'; } catch {}
     $('#faces').hidden = !FACE_ENABLED;
     if (FACE_ENABLED) faces.render();
     // "새 클립 만들기" always starts from an empty page, not the last video.
@@ -761,8 +763,10 @@ const create = {
     $('#btn-pick').textContent = '멤버 고르기';
   },
 
-  async load(file) {
+  /** @param {string} [sourceUrl] the YouTube link it came from (Colab can fetch it itself) */
+  async load(file, sourceUrl = null) {
     this.file = file;
+    this.sourceUrl = sourceUrl;
     if (this.url) URL.revokeObjectURL(this.url);
     this.url = URL.createObjectURL(file);
     const v = $('#src-video');
@@ -900,6 +904,7 @@ const create = {
     const box = t?.bbox ? [...full([t.bbox[0], t.bbox[1]]), ...full([t.bbox[2], t.bbox[3]])] : null;
     const { blob, meta } = await colab.extract(opts.file, {
       name, start: opts.start, end: opts.end, fps: opts.fps, maxSide: opts.maxSide, shape: opts.shape,
+      url: this.sourceUrl || null,
       faceRef: opts.faceRef ? Array.from(opts.faceRef) : null, pick: { tap: full(tap), box },
     }, {
       stop: opts.stop, signal: opts.signal,
@@ -1335,7 +1340,7 @@ const youtubeHelper = {
         this.render('working', { progress: 1, text: `앱으로 옮기는 중 ${Math.round(f * 100)}%` }));
       pcHelper.finish(id);
       id = null;
-      await create.load(file);
+      await create.load(file, this.url);
       const v = $('#src-video');
       if (Math.max(v.videoWidth, v.videoHeight) >= 2000) {
         $('#quality').value = '1920';

@@ -305,6 +305,45 @@ function makeRegionBuilder(w, h) {
 // ---------------------------------------------------------------------------
 // Edge refinement: a guided filter snaps the model's soft mask to colour edges (hair!).
 
+// Pieces of the matte floating away from her (a neighbour's raised arm inside her area): keep her
+// body - the biggest piece - and whatever touches the ground just around it; clear the rest.
+function makeStrayRemover(w, h) {
+  const n = w * h, label = new Int32Array(n), stack = new Int32Array(n), near = new Float32Array(n), tmp = new Float32Array(n);
+  const body = new Float32Array(n);
+  const reach = Math.max(2, Math.round(Math.max(w, h) * 0.015));
+  return alpha => {
+    label.fill(0);
+    let next = 0, best = 0, bestArea = 0;
+    const areas = [0];
+    for (let k = 0; k < n; k++) {
+      if (label[k] || alpha[k] < 0.3) continue;
+      const id = ++next;
+      let top = 0, area = 0;
+      stack[top++] = k; label[k] = id;
+      while (top) {
+        const q = stack[--top]; area++;
+        const x = q % w;
+        if (x > 0 && !label[q - 1] && alpha[q - 1] >= 0.3) { label[q - 1] = id; stack[top++] = q - 1; }
+        if (x < w - 1 && !label[q + 1] && alpha[q + 1] >= 0.3) { label[q + 1] = id; stack[top++] = q + 1; }
+        if (q >= w && !label[q - w] && alpha[q - w] >= 0.3) { label[q - w] = id; stack[top++] = q - w; }
+        if (q < n - w && !label[q + w] && alpha[q + w] >= 0.3) { label[q + w] = id; stack[top++] = q + w; }
+      }
+      areas.push(area);
+      if (area > bestArea) { bestArea = area; best = id; }
+    }
+    if (next < 2) return;
+    for (let k = 0; k < n; k++) body[k] = label[k] === best ? 1 : 0;
+    boxMean(body, w, h, reach, near, tmp);
+    const keep = new Uint8Array(next + 1);
+    keep[best] = 1;
+    for (let k = 0; k < n; k++) if (label[k] && near[k] > 0) keep[label[k]] = 1;
+    // (big pieces stay too: two halves of her split by a microphone stand)
+    for (let id = 1; id <= next; id++) if (areas[id] > bestArea * 0.25) keep[id] = 1;
+    // (faint edge pixels - hair - belong to no piece: they stay where they're near her body)
+    for (let k = 0; k < n; k++) if (alpha[k] > 0 && (label[k] ? !keep[label[k]] : near[k] === 0)) alpha[k] = 0;
+  };
+}
+
 function boxMean(src, w, h, r, out, tmp) {
   for (let y = 0; y < h; y++) {
     const row = y * w;
@@ -769,6 +808,7 @@ export async function extract(o) {
     let prevGray = null; // last frame's brightness, for smoothing still edges
     const guided = makeGuidedFilter(aw, ah);
     const buildRegion = makeRegionBuilder(aw, ah);
+    const dropStrays = makeStrayRemover(aw, ah);
     const radius = Math.max(2, Math.round(Math.max(aw, ah) / 110));
     const tracker = new Tracker(o.target, fps);
     let lastRegion = null, badMatte = 0;
@@ -1101,6 +1141,7 @@ export async function extract(o) {
                 }
                 alpha[k] = v < 0.02 ? 0 : v;
               }
+              dropStrays(alpha);
             }
           } else {
             // No matting model: snap SAM's soft mask to colour edges instead.

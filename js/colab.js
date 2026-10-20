@@ -47,13 +47,27 @@ export async function status(text) {
  * Resolves to { blob, meta: { layout, width, height, duration, partial } }.
  * `stop.requested` finishes early keeping what's made; `signal` cancels.
  */
-export async function extract(file, params, { onProgress, stop, signal }) {
+export async function extract(file, params, options) {
+  try {
+    return await run(file, params, options);
+  } catch (err) {
+    // The server couldn't get it from YouTube (it often blocks Colab): send the file instead.
+    if (params.url && /^download:/.test(err.message)) {
+      console.warn('Colab could not download it, sending the file:', err.message);
+      return run(file, { ...params, url: null }, options);
+    }
+    throw err;
+  }
+}
+
+async function run(file, params, { onProgress, stop, signal }) {
   const id = (await (await call('/jobs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(params) })).json()).id;
   const cancel = () => call(`/jobs/${id}`, { method: 'DELETE' }).catch(() => {});
   signal?.addEventListener('abort', cancel, { once: true });
   const aborted = () => { if (signal?.aborted) throw new DOMException('취소됨', 'AbortError'); };
   try {
-    const parts = Math.max(1, Math.ceil(file.size / PART));
+    // From YouTube: the server downloads it itself (faster than sending a big original from here).
+    const parts = params.url ? 0 : Math.max(1, Math.ceil(file.size / PART));
     for (let i = 0; i < parts; i++) {
       aborted();
       onProgress?.({ stage: `코랩으로 영상 보내는 중 ${Math.round(i / parts * 100)}%` });
@@ -71,6 +85,7 @@ export async function extract(file, params, { onProgress, stop, signal }) {
       if (s.state === 'cancelled') throw new DOMException('취소됨', 'AbortError');
       if (s.state === 'done') break;
       if (s.state === 'queued') onProgress?.({ stage: '코랩에서 앞 작업이 끝나길 기다리는 중' });
+      else if (s.state === 'downloading') onProgress?.({ stage: '코랩이 유튜브에서 영상 받는 중' });
       else if (s.stage || !s.total) onProgress?.({ stage: s.stage || '코랩에서 준비 중' });
       else {
         const elapsed = (performance.now() - t0) / 1000;
