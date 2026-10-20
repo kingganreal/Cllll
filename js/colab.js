@@ -60,6 +60,22 @@ export async function extract(file, params, options) {
   }
 }
 
+// The whole clip in one request (servers from older notebooks), counting what has arrived.
+async function fetchWhole(id, onProgress) {
+  const res = await call(`/jobs/${id}/result`);
+  const meta = JSON.parse(res.headers.get('X-Clip') || '{}');
+  const size = Number(res.headers.get('Content-Length')) || 0, reader = res.body.getReader(), chunks = [];
+  let sum = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    sum += value.byteLength;
+    onProgress?.({ stage: `완성된 클립 받는 중 ${(sum / 1048576).toFixed(1)}${size ? ` / ${(size / 1048576).toFixed(1)}` : ''}MB` });
+  }
+  return { blob: new Blob(chunks, { type: 'video/mp4' }), meta };
+}
+
 // Runs task(0..count-1) with at most `width` going at once.
 async function parallel(count, width, task) {
   let next = 0;
@@ -114,15 +130,37 @@ async function run(file, params, { onProgress, stop, signal }) {
     }
     onProgress?.({ stage: '완성된 클립 받는 중' });
     // Several ranges at once, for the same reason as the upload.
-    const { size, meta } = await (await call(`/jobs/${id}/info`)).json();
+    const info = await call(`/jobs/${id}/info`).then(r => r.json(), () => null);
+    if (!info) { // a notebook from before ranges
+      const whole = await fetchWhole(id, onProgress);
+      call(`/jobs/${id}`, { method: 'DELETE' }).catch(() => {});
+      return whole;
+    }
+    const { size, meta } = info;
     const RANGE = 8 * 1024 * 1024, n = Math.max(1, Math.ceil(size / RANGE)), pieces = new Array(n);
-    let got = 0;
+    const MB = v => (v / 1048576).toFixed(1);
+    const got = new Array(n).fill(0); // bytes so far of each piece (counted as they arrive)
+    const show = () => {
+      const sum = got.reduce((x, y) => x + y, 0);
+      onProgress?.({ stage: `완성된 클립 받는 중 ${Math.round(sum / size * 100)}% (${MB(sum)} / ${MB(size)}MB)` });
+    };
+    show();
     await parallel(n, 6, async i => {
       aborted();
       const a = i * RANGE, b = Math.min(size, a + RANGE) - 1;
-      pieces[i] = await retry(async () => (await call(`/jobs/${id}/result`, { headers: { Range: `bytes=${a}-${b}` } })).blob());
-      got += b - a + 1;
-      onProgress?.({ stage: `완성된 클립 받는 중 ${Math.round(got / size * 100)}% (${(size / 1048576).toFixed(0)}MB)` });
+      pieces[i] = await retry(async () => {
+        got[i] = 0;
+        const res = await call(`/jobs/${id}/result`, { headers: { Range: `bytes=${a}-${b}` } });
+        const reader = res.body.getReader(), chunks = [];
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(value);
+          got[i] += value.byteLength;
+          show();
+        }
+        return new Blob(chunks);
+      });
     });
     const blob = new Blob(pieces, { type: 'video/mp4' });
     call(`/jobs/${id}`, { method: 'DELETE' }).catch(() => {}); // free the server's disk
