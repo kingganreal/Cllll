@@ -220,7 +220,12 @@ class Frames:
         self.pos = int(round(self.cap.get(cv2.CAP_PROP_POS_FRAMES)))
         self.start, self.fps, self.size = start, fps, size
         self.total = max(1, int((end - start) * fps))
-        self.cache, self.last = {}, None
+        self.cache, self.full, self.last = {}, {}, None
+
+    def original(self, i):
+        """The same frame at the video's own size (the circle is cut from this, not the working size)."""
+        self.get(i)
+        return self.full[i]
 
     def get(self, i):
         if i in self.cache:
@@ -236,16 +241,18 @@ class Frames:
         if self.last is None:
             ok, self.last = self.cap.read()
         img = cv2.resize(self.last, self.size, interpolation=cv2.INTER_AREA)
-        self.cache[i] = img
+        self.cache[i], self.full[i] = img, self.last
         return img
 
     def close(self):
         self.cap.release()
         self.cache.clear()
+        self.full.clear()
 
     def forget_before(self, i):
         for k in [k for k in self.cache if k < i]:
             del self.cache[k]
+            self.full.pop(k, None)
 
 
 def probe(path):
@@ -397,7 +404,7 @@ def make_clip(video, out_dir, name='설윤', photos=(), start=0.0, end=None, fps
 
     # Output: colour and alpha packed like the app does (side by side for portrait, else stacked).
     if shape == 'circle':
-        side = even(min(W, H, 1080))
+        side = even(min(vw, vh, 1080))  # from the original frames, whatever the working size
         ow, oh = side, side
     else:
         ow, oh = W, H
@@ -457,10 +464,13 @@ def make_clip(video, out_dir, name='설윤', photos=(), start=0.0, end=None, fps
             colour = np.zeros((oh, ow, 3), np.uint8)
             alpha = np.zeros((oh, ow), np.float32)
             if cam is not None:
-                rad = cam[2]
-                cx, cy = min(max(cam[0], rad), W - rad), min(max(cam[1], rad), H - rad)
+                # Tracked at the working size, cut from the original frame (a 4K source stays sharp).
+                sx = vw / W
+                rad = cam[2] * sx
+                cx, cy = min(max(cam[0] * sx, rad), vw - rad), min(max(cam[1] * sx, rad), vh - rad)
                 M = np.array([[ow / (2 * rad), 0, -(cx - rad) * ow / (2 * rad)], [0, oh / (2 * rad), -(cy - rad) * oh / (2 * rad)]], np.float32)
-                colour = cv2.warpAffine(bgr, M, (ow, oh), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+                colour = cv2.warpAffine(frames.original(i), M, (ow, oh), flags=cv2.INTER_AREA if 2 * rad > ow else cv2.INTER_CUBIC,
+                                        borderMode=cv2.BORDER_REPLICATE)
                 alpha = disk * (0.0 if hidden else 1.0)
         else:
             colour, alpha = bgr, a
@@ -606,10 +616,11 @@ def make_clip(video, out_dir, name='설윤', photos=(), start=0.0, end=None, fps
 
 
 def download_youtube(url, out_dir):
-    """Up to 1080p: processing works at 1920 at most, and decoding 4K on Colab's two CPU cores is slow."""
+    """Up to 4K (the circle is cut from the original frames), preferring VP9 over AV1: OpenCV
+    decodes it reliably and faster on Colab's two CPU cores."""
     os.makedirs(out_dir, exist_ok=True)
     out = os.path.join(out_dir, '%(title).80s.%(ext)s')
-    r = subprocess.run(['yt-dlp', '-f', 'bv*[height<=1080]+ba/b', '--merge-output-format', 'mp4', '-o', out,
+    r = subprocess.run(['yt-dlp', '-f', 'bv*[height<=2160][vcodec^=vp]+ba/bv*[height<=2160]+ba/b', '--merge-output-format', 'mp4', '-o', out,
                         '--print', 'after_move:filepath', url], check=True, capture_output=True, text=True)
     return r.stdout.strip().splitlines()[-1]
 

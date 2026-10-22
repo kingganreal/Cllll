@@ -988,6 +988,9 @@ const create = {
     };
     // ~3.7 Mbps at 960, ~6.5 at 1280, ~15 at 1920 (30fps): the cut-out's edges need the bits.
     opts.bitrate = Math.round(opts.maxSide * opts.maxSide * 4 * opts.fps / 30);
+    // The circle is a full picture (stage, lights, other members behind her), not her alone on
+    // black: at the cut-out's bitrate it came out blocky.
+    if (opts.shape === 'circle') opts.bitrate *= 2.5;
     const name = $('#clip-name').value.trim() || '설윤';
 
     this.busy = true;
