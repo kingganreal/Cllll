@@ -155,6 +155,106 @@ class Matcher:
         return f['sim'] < (OTHER_LEARNED if self.seen >= 5 else OTHER)
 
 
+class YoloFollower:
+    """Follows her box with YOLO (as in js/processor.js trackWithYolo): YOLO finds everyone each
+    frame; her box is the one her face is in (checked every `every` frames), else the one that
+    continues her last box and has her colours (YOLO also finds the cameraman); a stranger's face
+    in her box sends it back to where her face last was, until her face shows again.
+    Boxes are [x0, y0, x1, y1] in the pixels of the frames given to step()."""
+
+    def __init__(self, fps, every, her_face, look, pick=None, first_her=None):
+        from ultralytics import YOLO
+        self.detector = YOLO('yolo11n.pt')
+        self.detector.to(DEVICE)
+        self.fps, self.every, self.her_face, self.look = fps, every, her_face, look
+        self.pick, self.first_her = pick, first_her
+        self.box = self.her_box = self.her_hist = None
+        self.frozen, self.vel, self.fixes = False, [0.0, 0.0], 0
+        self.last_her, self.doubted = None, False
+
+    @staticmethod
+    def iou(a, b):
+        ix = max(0, min(a[2], b[2]) - max(a[0], b[0])); iy = max(0, min(a[3], b[3]) - max(a[1], b[1]))
+        i_ = ix * iy
+        return i_ / ((a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - i_ + 1e-9)
+
+    @staticmethod
+    def hist_of(b, bgr):
+        x0, x1 = int(b[0] + (b[2] - b[0]) * 0.25), int(b[2] - (b[2] - b[0]) * 0.25)
+        y0, y1 = int(b[1] + (b[3] - b[1]) * 0.2), int(b[3] - (b[3] - b[1]) * 0.2)
+        patch = bgr[max(0, y0):max(1, y1):3, max(0, x0):max(1, x1):3][:, :, ::-1].reshape(-1, 3) >> 6
+        h = np.bincount(patch[:, 0] * 16 + patch[:, 1] * 4 + patch[:, 2], minlength=64).astype(np.float32)
+        return h / max(1, h.sum())
+
+    def step(self, i, bgr):
+        H, W = bgr.shape[:2]
+        area = lambda b: (b[2] - b[0]) * (b[3] - b[1])
+        res = self.detector(bgr, classes=[0], conf=0.3, verbose=False)[0]
+        boxes = [list(map(float, b)) for b in res.boxes.xyxy.cpu().numpy()]
+        choice = None
+        if self.box is None:  # the first frame: where she was picked
+            if self.pick is not None and self.pick.get('box'):
+                b = self.pick['box']
+                self.box = [b[0] * W, b[1] * H, b[2] * W, b[3] * H]
+            else:
+                if self.pick is not None:
+                    px_, py_ = self.pick['tap'][0] * W, self.pick['tap'][1] * H
+                    inside = [b for b in boxes if b[0] < px_ < b[2] and b[1] < py_ < b[3]]
+                elif self.first_her is not None:
+                    f = self.first_her
+                    fx, fy = (f['box'][0] + f['box'][2]) / 2, (f['box'][1] + f['box'][3]) / 2
+                    inside = [b for b in boxes if b[0] < fx < b[2] and b[1] < fy < b[1] + (b[3] - b[1]) * 0.45]
+                else:
+                    inside = []
+                choice = min(inside, key=area) if inside else None
+            self.her_box = self.box
+        if self.her_face is not None and i % self.every == 0:
+            found, her = self.look(bgr)
+            in_box = lambda f, b: b[0] < (f['box'][0] + f['box'][2]) / 2 < b[2] and b[1] < (f['box'][1] + f['box'][3]) / 2 < b[1] + (b[3] - b[1]) * 0.45
+            if her is not None:
+                self.last_her = ((her['box'][0] + her['box'][2]) / 2, (her['box'][1] + her['box'][3]) / 2, her['box'][2] - her['box'][0], i)
+                self.doubted = False
+                mine = [b for b in boxes if in_box(her, b)]
+                if mine:
+                    m = min(mine, key=area)
+                    if self.box is not None and self.iou(m, self.box) < 0.3:
+                        self.fixes += 1
+                    choice, self.her_box, self.frozen = m, m, False
+                    h = self.hist_of(m, bgr)
+                    self.her_hist = h if self.her_hist is None else self.her_hist * 0.7 + h * 0.3
+            elif self.box is not None:
+                strangers = [f for f in found if self.her_face.other(f) and frontal(f) and f['size'] > max(W, H) * 0.024 and in_box(f, self.box)]
+                if strangers:
+                    lh = self.last_her
+                    near = lambda f: lh is not None and i - lh[3] <= self.fps and math.hypot((f['box'][0] + f['box'][2]) / 2 - lh[0], (f['box'][1] + f['box'][3]) / 2 - lh[1]) < 1.5 * lh[2]
+                    if all(near(f) for f in strangers) and not self.doubted:
+                        self.doubted = True
+                    elif self.her_box is not None:
+                        self.box, self.vel, self.frozen = list(self.her_box), [0.0, 0.0], True
+                        self.fixes += 1
+                else:
+                    self.doubted = False
+        if self.her_hist is None and (choice or self.box):
+            self.her_hist = self.hist_of(choice or self.box, bgr)
+        if choice is None and self.box is not None and not self.frozen:
+            b0, v = self.box, self.vel
+            guess = [b0[0] + v[0], b0[1] + v[1], b0[2] + v[0], b0[3] + v[1]]
+            best = 0.25
+            for b in boxes:
+                sc = self.iou(b, guess)
+                if sc > best and (self.her_hist is None or float(np.sqrt(self.hist_of(b, bgr) * self.her_hist).sum()) > 0.6):
+                    choice, best = b, sc
+        if choice is not None:
+            if self.box is not None:
+                b0 = self.box
+                dx = (choice[0] + choice[2] - b0[0] - b0[2]) / 2; dy = (choice[1] + choice[3] - b0[1] - b0[3]) / 2
+                self.vel = [self.vel[0] * 0.5 + dx * 0.5, self.vel[1] * 0.5 + dy * 0.5]
+            self.box = [self.box[k] + (choice[k] - self.box[k]) * 0.6 for k in range(4)] if self.box is not None and self.iou(choice, self.box) > 0.3 else list(choice)
+        else:
+            self.vel = [self.vel[0] * 0.8, self.vel[1] * 0.8]
+        return self.box
+
+
 def reference_from_photos(faces, paths):
     embs = []
     for p in paths:
@@ -397,11 +497,7 @@ def make_clip(video, out_dir, name='설윤', photos=(), start=0.0, end=None, fps
     # The circle can follow her with YOLO boxes instead of SAM 2: much faster, a little less sure
     # when members cross with her face hidden.
     use_yolo = shape == 'circle' and tracker == 'yolo'
-    if use_yolo:
-        from ultralytics import YOLO
-        detector = YOLO('yolo11n.pt')
-        detector.to(DEVICE)
-    else:
+    if not use_yolo:
         from sam2.build_sam import build_sam2_video_predictor
         if sam_model == 'auto':
             # base+ where the GPU has bfloat16 (A100, L4); on a T4 (float32 only) small is about twice
@@ -590,108 +686,30 @@ def make_clip(video, out_dir, name='설윤', photos=(), start=0.0, end=None, fps
                 break
             i0, prompt = restart
     else:
-        # Circle with the fast tracker (as in js/processor.js trackWithYolo): YOLO finds everyone
-        # each frame; her box is the one her face is in (every quarter second), else the one that
-        # continues her last box and has her colours; a stranger's face in her box sends the
-        # circle back to where her face last was.
+        # Circle with the fast tracker: YOLO boxes instead of SAM 2 (see YoloFollower).
         one = None
-        every = max(1, int(round(fps * face_every)))
-        fixes, next_i = 0, skip
-        last_her, doubted = None, False
+        follower = YoloFollower(fps, max(1, int(round(fps * face_every))), her_face, look, pick, first[1])
+        next_i = skip
         from tqdm.auto import tqdm
         bar = tqdm(total=total - skip, unit='프레임')
         report(skip, total, None)
-
-        def box_iou(a, b):
-            ix = max(0, min(a[2], b[2]) - max(a[0], b[0])); iy = max(0, min(a[3], b[3]) - max(a[1], b[1]))
-            i_ = ix * iy
-            return i_ / ((a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - i_ + 1e-9)
-
-        def hist_of(b, bgr):
-            x0, x1 = int(b[0] + (b[2] - b[0]) * 0.25), int(b[2] - (b[2] - b[0]) * 0.25)
-            y0, y1 = int(b[1] + (b[3] - b[1]) * 0.2), int(b[3] - (b[3] - b[1]) * 0.2)
-            patch = bgr[max(0, y0):max(1, y1):3, max(0, x0):max(1, x1):3][:, :, ::-1].reshape(-1, 3) >> 6
-            h = np.bincount(patch[:, 0] * 16 + patch[:, 1] * 4 + patch[:, 2], minlength=64).astype(np.float32)
-            return h / max(1, h.sum())
-
-        alike = lambda a, b: float(np.sqrt(a * b).sum())
-        box = None
-        if pick is not None and pick.get('box'):
-            b = pick['box']
-            box = [b[0] * W, b[1] * H, b[2] * W, b[3] * H]
-        elif first[1] is not None:  # found by face in this notebook
-            box = None
-        her_box, her_hist, frozen, vel = box, None, False, [0.0, 0.0]
-        tap = (pick['tap'][0] * W, pick['tap'][1] * H) if pick is not None else None
-        area = lambda b: (b[2] - b[0]) * (b[3] - b[1])
         for i in range(skip, total):
             if cancelled and cancelled():
                 ff.stdin.close(); ff.wait()
                 raise Stopped('취소됐어요')
             if should_stop and should_stop() and i > skip:
                 break
-            bgr = frames.get(i)
-            res = detector(bgr, classes=[0], conf=0.3, verbose=False)[0]
-            boxes = [list(map(float, b)) for b in res.boxes.xyxy.cpu().numpy()]
-            choice = None
-            if box is None:
-                if tap is not None:
-                    inside = [b for b in boxes if b[0] < tap[0] < b[2] and b[1] < tap[1] < b[3]]
-                    choice = min(inside, key=area) if inside else None
-                elif first[1] is not None:
-                    her0 = first[1]
-                    fx, fy = (her0['box'][0] + her0['box'][2]) / 2, (her0['box'][1] + her0['box'][3]) / 2
-                    inside = [b for b in boxes if b[0] < fx < b[2] and b[1] < fy < b[1] + (b[3] - b[1]) * 0.45]
-                    choice = min(inside, key=area) if inside else None
-            if her_face is not None and i % every == 0:
-                found, her = look(bgr)
-                in_box = lambda f, b: b[0] < (f['box'][0] + f['box'][2]) / 2 < b[2] and b[1] < (f['box'][1] + f['box'][3]) / 2 < b[1] + (b[3] - b[1]) * 0.45
-                if her is not None:
-                    last_her = ((her['box'][0] + her['box'][2]) / 2, (her['box'][1] + her['box'][3]) / 2, her['box'][2] - her['box'][0], i)
-                    doubted = False
-                    mine = [b for b in boxes if in_box(her, b)]
-                    if mine:
-                        m = min(mine, key=area)
-                        if box is not None and box_iou(m, box) < 0.3:
-                            fixes += 1
-                        choice, her_box, frozen = m, m, False
-                        h = hist_of(m, bgr)
-                        her_hist = h if her_hist is None else her_hist * 0.7 + h * 0.3
-                elif box is not None:
-                    strangers = [f for f in found if her_face.other(f) and frontal(f) and f['size'] > max(W, H) * 0.024 and in_box(f, box)]
-                    if strangers:
-                        near = lambda f: last_her is not None and i - last_her[3] <= fps and math.hypot((f['box'][0] + f['box'][2]) / 2 - last_her[0], (f['box'][1] + f['box'][3]) / 2 - last_her[1]) < 1.5 * last_her[2]
-                        if all(near(f) for f in strangers) and not doubted:
-                            doubted = True
-                        elif her_box is not None:
-                            box, vel, frozen = list(her_box), [0.0, 0.0], True
-                            fixes += 1
-                    else:
-                        doubted = False
-            if her_hist is None and (choice or box):
-                her_hist = hist_of(choice or box, bgr)
-            if choice is None and box is not None and not frozen:
-                guess = [box[0] + vel[0], box[1] + vel[1], box[2] + vel[0], box[3] + vel[1]]
-                best = 0.25
-                for b in boxes:
-                    sc = box_iou(b, guess)
-                    if sc > best and (her_hist is None or alike(hist_of(b, bgr), her_hist) > 0.6):
-                        choice, best = b, sc
-            if choice is not None:
-                if box is not None:
-                    dx = (choice[0] + choice[2] - box[0] - box[2]) / 2; dy = (choice[1] + choice[3] - box[1] - box[3]) / 2
-                    vel = [vel[0] * 0.5 + dx * 0.5, vel[1] * 0.5 + dy * 0.5]
-                box = [box[k] + (choice[k] - box[k]) * 0.6 for k in range(4)] if box is not None and box_iou(choice, box) > 0.3 else list(choice)
-            else:
-                vel = [vel[0] * 0.8, vel[1] * 0.8]
-            core = np.zeros((H, W), bool)
+            box = follower.step(i, frames.get(i))
+            core = None
             if box is not None:
+                core = np.zeros((H, W), bool)
                 core[max(0, int(box[1])):min(H, int(box[3]) + 1), max(0, int(box[0])):min(W, int(box[2]) + 1)] = True
-            write(i, core if box is not None else None, False)
+            write(i, core, False)
             next_i = i + 1
             bar.update(1)
             report(next_i, total, None)
             frames.forget_before(i)
+        fixes = follower.fixes
     written = next_i - skip
     frames.close()
     bar.close()
