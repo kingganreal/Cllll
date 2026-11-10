@@ -30,7 +30,7 @@ function toast(msg, ms = 2600) {
 // ---------------------------------------------------------------------------
 // Routing
 
-const views = { library: $('#view-library'), create: $('#view-create'), stage: $('#view-stage') };
+const views = { library: $('#view-library'), create: $('#view-create'), stage: $('#view-stage'), '3d': $('#view-3d') };
 let current = null;
 
 function go(name) {
@@ -39,12 +39,34 @@ function go(name) {
   if (current === name) return;
   if (current === 'stage') stage.leave();
   if (current === 'create') create.leave();
+  if (current === '3d') viewer3d.leave();
   current = name;
   for (const [k, el] of Object.entries(views)) el.hidden = k !== name;
   if (name === 'library') library.render();
   if (name === 'create') create.enter();
   if (name === 'stage') stage.enter();
+  if (name === '3d') viewer3d.enter();
 }
+
+// 3D clips (js/body3d.js): their own view, where she can be turned and zoomed.
+const viewer3d = {
+  clipId: null, view: null,
+  open(id) { this.clipId = id; if (current === '3d') { this.leave(); this.enter(); } else go('3d'); },
+  async enter() {
+    const c = this.clipId && await clips.get(this.clipId);
+    if (!c) { go('library'); return; }
+    $('#v3d-title').textContent = c.name;
+    const { Body3D, parse } = await import('./body3d.js');
+    this.view = new Body3D($('#v3d-host'), await parse(c.blob));
+    this.view.play();
+    $('#v3d-play').textContent = '일시정지';
+  },
+  leave() { this.view?.dispose(); this.view = null; },
+};
+$('#v3d-play').addEventListener('click', () => {
+  if (viewer3d.view) $('#v3d-play').textContent = viewer3d.view.toggle() ? '일시정지' : '재생';
+});
+const is3d = c => c.kind === '3d';
 document.addEventListener('click', e => {
   const nav = e.target.closest('[data-nav]');
   if (nav) go(nav.dataset.nav);
@@ -88,13 +110,14 @@ const library = {
     for (const c of list) grid.append(this.card(c));
     // With the Windows app running, clips can go straight onto the desktop.
     if (await pcHelper.desktopRunning()) {
-      for (const b of grid.querySelectorAll('[data-a=desktop]')) b.hidden = false;
+      for (const b of grid.querySelectorAll('[data-a=desktop]')) b.hidden = b.closest('.card')?.dataset.kind === '3d';
     }
   },
 
   card(c) {
     const el = document.createElement('article');
     el.className = 'card';
+    el.dataset.kind = c.kind || 'clip';
     const thumb = document.createElement('div');
     thumb.className = 'card-thumb checker';
     if (c.thumbnail) {
@@ -103,16 +126,16 @@ const library = {
       img.alt = c.name;
       thumb.append(img);
     }
-    thumb.addEventListener('click', () => stage.addAndOpen(c.id));
+    thumb.addEventListener('click', () => (is3d(c) ? viewer3d.open(c.id) : stage.addAndOpen(c.id)));
     const body = document.createElement('div');
     body.className = 'card-body';
     const sizeMb = (c.blob.size / 1048576).toFixed(c.blob.size > 1e7 ? 0 : 1);
     body.innerHTML = `
       <div><div class="card-name"></div>
-      <div class="card-meta mono">${fmtTime(c.duration)} · ${c.hasAudio ? '소리 있음' : '소리 없음'} · ${sizeMb}MB</div>
+      <div class="card-meta mono">${is3d(c) ? '3D · ' : ''}${fmtTime(c.duration)} · ${c.hasAudio ? '소리 있음' : '소리 없음'} · ${sizeMb}MB</div>
       <div class="card-meta sync-badge" data-sync="${c.id}">${cloud.on ? (c.inDrive ? '모든 기기에 있음' : '올리기 대기') : ''}</div></div>
       <div class="card-actions">
-        <button class="btn primary" type="button" data-a="stage">무대로</button>
+        <button class="btn primary" type="button" data-a="stage">${is3d(c) ? '3D 보기' : '무대로'}</button>
         <button class="btn ghost" type="button" data-a="desktop" hidden>바탕화면에</button>
         <button class="btn ghost" type="button" data-a="rename">이름</button>
         <button class="btn ghost" type="button" data-a="save">저장</button>
@@ -124,7 +147,7 @@ const library = {
       const b = e.target.closest('[data-a]');
       if (!b) return;
       const a = b.dataset.a;
-      if (a === 'stage') stage.addAndOpen(c.id);
+      if (a === 'stage') is3d(c) ? viewer3d.open(c.id) : stage.addAndOpen(c.id);
       if (a === 'desktop') sendToDesktop(c, b);
       if (a === 'save') downloadClip(c);
       if (a === 'rename') {
@@ -188,7 +211,8 @@ function downloadClip(c) {
   const a = document.createElement('a');
   a.href = URL.createObjectURL(c.blob);
   // The layout is kept in the name so 가져오기 can read it back.
-  a.download = `${c.name.replace(/[\\/:*?"<>|]/g, '_')}.stage-${c.layout}.mp4`;
+  a.download = is3d(c) ? `${c.name.replace(/[\\/:*?"<>|]/g, '_')}.fancam3d`
+    : `${c.name.replace(/[\\/:*?"<>|]/g, '_')}.stage-${c.layout}.mp4`;
   document.body.append(a);
   a.click();
   a.remove();
@@ -214,8 +238,17 @@ $('#import-input').addEventListener('change', async e => {
   cloud.kick();
 });
 
-// Reads back a clip saved with "저장" (or any colour|alpha packed MP4).
+// Reads back a clip saved with "저장" (or any colour|alpha packed MP4, or a .fancam3d).
 async function importClip(file) {
+  if (/\.fancam3d$/i.test(file.name)) {
+    const { parse, thumbnail } = await import('./body3d.js');
+    const { header, audio } = await parse(file);
+    await clips.put({
+      id: uid(), kind: '3d', name: file.name.replace(/\.fancam3d$/i, ''), created: Date.now(), blob: file,
+      thumbnail: await thumbnail(file), duration: header.frames / header.fps, hasAudio: !!audio,
+    });
+    return;
+  }
   const v = document.createElement('video');
   v.muted = true; v.playsInline = true; v.preload = 'auto';
   v.src = URL.createObjectURL(file);
@@ -291,7 +324,7 @@ const pcBackup = {
     try {
       let seen;
       try { seen = new Set(JSON.parse(localStorage.getItem(BACKUP_SEEN)) || []); } catch { seen = new Set(); }
-      const mine = await clips.all();
+      const mine = (await clips.all()).filter(c => !is3d(c));
       const kept = await pcHelper.listBackups();
       const there = new Set(kept.map(c => c.id));
       const here = new Set(mine.map(c => c.id));
@@ -428,7 +461,7 @@ const cloud = {
 
     // 2. Changes made on other devices: deletions and renames.
     const remoteById = new Map(remote.map(r => [r.id, r]));
-    const local = await clips.all();
+    const local = (await clips.all()).filter(c => !is3d(c));
     let changed = false;
     for (const c of local) {
       const r = remoteById.get(c.id);
@@ -454,7 +487,7 @@ const cloud = {
     if (changed) library.refresh();
 
     // 3. New clips from this device.
-    const toUpload = (await clips.all()).filter(c => !c.inDrive && !remoteById.has(c.id));
+    const toUpload = (await clips.all()).filter(c => !is3d(c) && !c.inDrive && !remoteById.has(c.id));
     for (const [i, c] of toUpload.entries()) {
       const label = `드라이브에 올리는 중 (${i + 1}/${toUpload.length}) ${c.name}`;
       this.status(label, 'busy');
@@ -916,8 +949,16 @@ const create = {
       faceRef: opts.faceRef ? Array.from(opts.faceRef) : null, pick: { tap: full(tap), box },
     }, {
       stop: opts.stop, signal: opts.signal,
-      onProgress: info => opts.onProgress(info.stage ? info : { ...info, sam: true, face: !!opts.faceRef, found: true }),
+      onProgress: info => opts.onProgress(info.stage ? info : {
+        ...info, found: true, face: !!opts.faceRef, colab: true, threeD: opts.shape === '3d', circle: opts.shape === 'circle',
+        yolo: opts.shape === '3d' || (opts.shape === 'circle' && opts.tracker !== 'sam'),
+        sam: opts.shape === 'cutout' || (opts.shape === 'circle' && opts.tracker === 'sam'), matting: opts.shape === 'cutout',
+      }),
     });
+    if (meta.kind === '3d') {
+      const { thumbnail } = await import('./body3d.js');
+      return { kind: '3d', blob, thumbnail: await thumbnail(blob), duration: meta.duration, hasAudio: true, partial: !!meta.partial };
+    }
     const thumbnail = await clipThumbnail(blob, meta.layout, meta.width, meta.height);
     return {
       blob, thumbnail, layout: meta.layout, crop: { x: 0, y: 0, w: 1, h: 1 }, width: meta.width, height: meta.height,
@@ -1017,7 +1058,11 @@ const create = {
       if (info.stage) { $('#progress-text').textContent = info.stage + '…'; return; }
       const pct = info.done / info.total * 100;
       $('#progress-bar').style.width = pct.toFixed(1) + '%';
-      const mode = (info.sam ? 'SAM 2 추적 + GPU 누끼' : info.matting ? 'GPU 고급 누끼' : '기본 누끼')
+      // what is actually doing the work (the circle has no cut-out; 3D is SAM 3D Body on Colab)
+      const track = info.yolo ? 'YOLO 빠른 추적' : info.sam ? 'SAM 2 추적' : '포즈 추적';
+      const mode = (info.colab ? '코랩 GPU · ' : '')
+        + (info.threeD ? `${track} + SAM 3D Body` : info.circle ? track
+          : info.sam ? 'SAM 2 추적 + GPU 누끼' : info.matting ? 'GPU 고급 누끼' : '기본 누끼')
         + (info.face ? ` + 얼굴 확인${info.fixes ? ` (${info.fixes}번 바로잡음)` : ''}` : '');
       $('#progress-text').textContent =
         `${info.done} / ${info.total} 프레임 · ${pct.toFixed(0)}% · 남은 시간 약 ${fmtTime(info.eta)}\n${mode}${info.found ? '' : ' · 멤버를 놓쳐서 다시 찾는 중'}`;
@@ -1030,6 +1075,7 @@ const create = {
     };
     try {
       const remote = colab.parse() && await colab.status();
+      if (opts.shape === '3d' && !remote) throw new Error('3D는 코랩 GPU에서 만들어요. 위의 "코랩 GPU로 처리"에 코랩 주소를 넣고 코랩을 켜 주세요.');
       const result = remote ? await this.extractOnColab(opts, name) : await p.extract(opts);
       if (runId !== this.runId) return; // cancelled meanwhile
       const clip = { id: uid(), name, created: Date.now(), ...result };
@@ -1038,6 +1084,12 @@ const create = {
       await clips.put(clip);
       requestPersistence();
       cloud.kick();
+      if (is3d(clip)) {
+        toast(result.partial ? `${fmtTime(result.duration)}까지 3D로 만들었어요` : '3D 완성!');
+        this.done();
+        viewer3d.open(clip.id);
+        return;
+      }
       toast(result.error ? `중간에 오류가 나서 ${fmtTime(result.duration)}까지 저장했어요. 무대에 올렸어요` : result.partial ? `${fmtTime(result.duration)}까지 저장했어요. 무대에 올렸어요` : '완성! 무대에 올렸어요', result.error ? 5000 : undefined);
       this.done();
       await stage.addAndOpen(clip.id);
@@ -1621,7 +1673,7 @@ const stage = {
   closeSheet() { $('#sheet').hidden = true; },
 
   async showAddSheet() {
-    const list = await clips.all();
+    const list = (await clips.all()).filter(c => !is3d(c));
     const wrap = document.createElement('div');
     if (!list.length) {
       wrap.innerHTML = '<p class="hint">아직 클립이 없어요. 보관함에서 직캠 영상으로 먼저 만들어 주세요.</p>';

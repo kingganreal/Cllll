@@ -1393,7 +1393,7 @@ export async function extract(o) {
         const elapsed = (performance.now() - t0) / 1000;
         o.onProgress?.({
           done: i + 1, total, elapsed, eta: elapsed / (i + 1) * (total - i - 1),
-          preview: out, layout, found, matting: !!matter, sam: !!sam, face: !!faceModels, fixes: faceFixes, decoder: source.kind,
+          preview: out, layout, found, matting: !!matter, sam: !!sam, yolo: yoloTrack, circle: o.shape === 'circle', face: !!faceModels, fixes: faceFixes, decoder: source.kind,
         });
       }
     } catch (err) {
