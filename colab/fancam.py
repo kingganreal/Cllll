@@ -295,7 +295,7 @@ class Stopped(Exception):
 
 def make_clip(video, out_dir, name='설윤', photos=(), start=0.0, end=None, fps=30, max_side=1280,
               shape='cutout', sam_model='auto', chunk=300, face_every=0.25, crop=True,
-              ref=None, pick=None, on_progress=None, should_stop=None, cancelled=None):
+              ref=None, pick=None, on_progress=None, should_stop=None, cancelled=None, tracker='sam'):
     """Makes the clip; returns {'path', 'layout', 'width', 'height', 'duration', 'fixes'}.
 
     From the app (colab/server.py): `ref` is her face (the registered photos' average embedding,
@@ -303,7 +303,6 @@ def make_clip(video, out_dir, name='설윤', photos=(), start=0.0, end=None, fps
     picked on the first frame (0..1 of the whole frame); `on_progress(done, total, stage)` reports,
     `should_stop()` ends early keeping what's made (여기까지 저장), `cancelled()` aborts.
     """
-    from sam2.build_sam import build_sam2_video_predictor
     import torchvision
 
     vw, vh, dur = probe(video)
@@ -395,12 +394,21 @@ def make_clip(video, out_dir, name='설윤', photos=(), start=0.0, end=None, fps
     rec = [None] * 4
     ratio = min(1.0, 512 / max(W, H))
 
-    if sam_model == 'auto':
-        # base+ where the GPU has bfloat16 (A100, L4); on a T4 (float32 only) small is about twice
-        # as fast and follows her just as well.
-        sam_model = 'base_plus' if BF16 else 'small'
-    cfg, url = SAM_MODELS[sam_model]
-    predictor = build_sam2_video_predictor(cfg, fetch(url), device=DEVICE)
+    # The circle can follow her with YOLO boxes instead of SAM 2: much faster, a little less sure
+    # when members cross with her face hidden.
+    use_yolo = shape == 'circle' and tracker == 'yolo'
+    if use_yolo:
+        from ultralytics import YOLO
+        detector = YOLO('yolo11n.pt')
+        detector.to(DEVICE)
+    else:
+        from sam2.build_sam import build_sam2_video_predictor
+        if sam_model == 'auto':
+            # base+ where the GPU has bfloat16 (A100, L4); on a T4 (float32 only) small is about twice
+            # as fast and follows her just as well.
+            sam_model = 'base_plus' if BF16 else 'small'
+        cfg, url = SAM_MODELS[sam_model]
+        predictor = build_sam2_video_predictor(cfg, fetch(url), device=DEVICE)
 
     # Output: colour and alpha packed like the app does (side by side for portrait, else stacked).
     if shape == 'circle':
@@ -486,106 +494,211 @@ def make_clip(video, out_dir, name='설윤', photos=(), start=0.0, end=None, fps
             packed[:oh] = colour; packed[oh:] = a8[..., None]
         ff.stdin.write(packed.tobytes())
 
-    # SAM 2 reads frames from here as it needs them, instead of loading the whole video first (that
-    # is what takes the memory: ~12 MB a frame at its 1024 size), and memories it won't look at again
-    # are dropped as it goes - so a whole fancam runs in one go. Only a re-anchor starts it over.
-    size = predictor.image_size
-    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+    if not use_yolo:
+        # SAM 2 reads frames from here as it needs them, instead of loading the whole video first (that
+        # is what takes the memory: ~12 MB a frame at its 1024 size), and memories it won't look at again
+        # are dropped as it goes - so a whole fancam runs in one go. Only a re-anchor starts it over.
+        size = predictor.image_size
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 
-    class LazyFrames:
-        def __init__(self, first):
-            self.first = first
+        class LazyFrames:
+            def __init__(self, first):
+                self.first = first
 
-        def __len__(self):
-            return total - self.first
+            def __len__(self):
+                return total - self.first
 
-        def __getitem__(self, k):
-            img = cv2.resize(frames.get(self.first + k), (size, size), interpolation=cv2.INTER_AREA)[:, :, ::-1]
-            return (torch.from_numpy(img.copy()).permute(2, 0, 1).float().div(255) - mean) / std
+            def __getitem__(self, k):
+                img = cv2.resize(frames.get(self.first + k), (size, size), interpolation=cv2.INTER_AREA)[:, :, ::-1]
+                return (torch.from_numpy(img.copy()).permute(2, 0, 1).float().div(255) - mean) / std
 
-    one = os.path.join(CACHE, 'first')
+        one = os.path.join(CACHE, 'first')
 
-    def start_state(first, prompt):
-        shutil.rmtree(one, ignore_errors=True)
-        os.makedirs(one)
-        cv2.imwrite(os.path.join(one, '00000.jpg'), frames.get(first))
-        state = predictor.init_state(video_path=one, offload_video_to_cpu=True, offload_state_to_cpu=DEVICE == 'cuda')
-        state['images'], state['num_frames'] = LazyFrames(first), total - first
-        state['video_height'], state['video_width'] = H, W  # masks come back at the working size
-        state['cached_features'] = {}
-        kind, p = prompt
-        if kind == 'mask':
-            predictor.add_new_mask(state, frame_idx=0, obj_id=1, mask=p)
-        else:
-            pts, labels, box = p
-            predictor.add_new_points_or_box(state, frame_idx=0, obj_id=1, points=pts, labels=labels, box=box)
-        return state
+        def start_state(first, prompt):
+            shutil.rmtree(one, ignore_errors=True)
+            os.makedirs(one)
+            cv2.imwrite(os.path.join(one, '00000.jpg'), frames.get(first))
+            state = predictor.init_state(video_path=one, offload_video_to_cpu=True, offload_state_to_cpu=DEVICE == 'cuda')
+            state['images'], state['num_frames'] = LazyFrames(first), total - first
+            state['video_height'], state['video_width'] = H, W  # masks come back at the working size
+            state['cached_features'] = {}
+            kind, p = prompt
+            if kind == 'mask':
+                predictor.add_new_mask(state, frame_idx=0, obj_id=1, mask=p)
+            else:
+                pts, labels, box = p
+                predictor.add_new_points_or_box(state, frame_idx=0, obj_id=1, points=pts, labels=labels, box=box)
+            return state
 
-    every = max(1, int(round(fps * face_every)))
-    fixes, i0, next_i = 0, skip, skip
-    off_face, last_her, doubted, hide = 0, None, False, False
-    from tqdm.auto import tqdm
-    bar = tqdm(total=total - skip, unit='프레임')
-    report(skip, total, None)
-    stopped = False
-    while next_i < total and not stopped:
-        restart = None
-        with torch.inference_mode(), torch.autocast(DEVICE, dtype=torch.bfloat16, enabled=BF16):
-            state = start_state(i0, prompt)
-            for k, _, logits in predictor.propagate_in_video(state):
-                i = i0 + k
-                if cancelled and cancelled():
-                    ff.stdin.close(); ff.wait()
-                    raise Stopped('취소됐어요')
-                if should_stop and should_stop() and i > skip:
-                    stopped = True
-                    break
-                core = logits[0, 0].float().cpu().numpy() > 0
-                # SAM looks back at the picked frame and the last few only.
-                for o in state['output_dict_per_obj'].values():
-                    for old in [t for t in o['non_cond_frame_outputs'] if t < k - 20]:
-                        del o['non_cond_frame_outputs'][old]
+        every = max(1, int(round(fps * face_every)))
+        fixes, i0, next_i = 0, skip, skip
+        off_face, last_her, doubted, hide = 0, None, False, False
+        from tqdm.auto import tqdm
+        bar = tqdm(total=total - skip, unit='프레임')
+        report(skip, total, None)
+        stopped = False
+        while next_i < total and not stopped:
+            restart = None
+            with torch.inference_mode(), torch.autocast(DEVICE, dtype=torch.bfloat16, enabled=BF16):
+                state = start_state(i0, prompt)
+                for k, _, logits in predictor.propagate_in_video(state):
+                    i = i0 + k
+                    if cancelled and cancelled():
+                        ff.stdin.close(); ff.wait()
+                        raise Stopped('취소됐어요')
+                    if should_stop and should_stop() and i > skip:
+                        stopped = True
+                        break
+                    core = logits[0, 0].float().cpu().numpy() > 0
+                    # SAM looks back at the picked frame and the last few only.
+                    for o in state['output_dict_per_obj'].values():
+                        for old in [t for t in o['non_cond_frame_outputs'] if t < k - 20]:
+                            del o['non_cond_frame_outputs'][old]
 
-                # Face check: if the tracker has left her, start again from her face here.
-                if i % every == 0 and her_face is not None:
-                    found, her = look(frames.get(i))
-                    in_mask = lambda f: np.mean([core[int(min(H - 1, max(0, y))), int(min(W - 1, max(0, x)))] for x, y in f['kps'][:3]]) >= 0.6
-                    strangers = [f for f in found if f is not her and her_face.other(f) and frontal(f) and f['size'] > max(W, H) * 0.024 and in_mask(f)]
-                    if her is not None:
-                        hide, doubted = False, False
-                        last_her = ((her['box'][0] + her['box'][2]) / 2, (her['box'][1] + her['box'][3]) / 2, her['box'][2] - her['box'][0], i)
-                        off_face = off_face + 1 if not in_mask(her) else 0
-                        apart = [f for f in strangers if math.hypot((f['box'][0] + f['box'][2]) / 2 - last_her[0], (f['box'][1] + f['box'][3]) / 2 - last_her[1]) > 1.5 * last_her[2]]
-                        if (off_face >= 2 or apart) and k > 0:
-                            off_face = 0
-                            restart = (i, ('points', prompt_from_face(frames.get(i), her, found)))
+                    # Face check: if the tracker has left her, start again from her face here.
+                    if i % every == 0 and her_face is not None:
+                        found, her = look(frames.get(i))
+                        in_mask = lambda f: np.mean([core[int(min(H - 1, max(0, y))), int(min(W - 1, max(0, x)))] for x, y in f['kps'][:3]]) >= 0.6
+                        strangers = [f for f in found if f is not her and her_face.other(f) and frontal(f) and f['size'] > max(W, H) * 0.024 and in_mask(f)]
+                        if her is not None:
+                            hide, doubted = False, False
+                            last_her = ((her['box'][0] + her['box'][2]) / 2, (her['box'][1] + her['box'][3]) / 2, her['box'][2] - her['box'][0], i)
+                            off_face = off_face + 1 if not in_mask(her) else 0
+                            apart = [f for f in strangers if math.hypot((f['box'][0] + f['box'][2]) / 2 - last_her[0], (f['box'][1] + f['box'][3]) / 2 - last_her[1]) > 1.5 * last_her[2]]
+                            if (off_face >= 2 or apart) and k > 0:
+                                off_face = 0
+                                restart = (i, ('points', prompt_from_face(frames.get(i), her, found)))
+                                fixes += 1
+                                break
+                        elif strangers:
+                            near = lambda f: last_her is not None and i - last_her[3] <= fps and math.hypot((f['box'][0] + f['box'][2]) / 2 - last_her[0], (f['box'][1] + f['box'][3]) / 2 - last_her[1]) < 1.5 * last_her[2]
+                            if all(near(f) for f in strangers) and not doubted:
+                                doubted = True
+                            else:
+                                hide = True
+                        else:
+                            doubted = False
+
+                    write(i, core, hide)
+                    next_i = i + 1
+                    bar.update(1)
+                    report(next_i, total, None)
+                    frames.forget_before(i)
+                predictor.reset_state(state)
+            if restart is None:
+                break
+            i0, prompt = restart
+    else:
+        # Circle with the fast tracker (as in js/processor.js trackWithYolo): YOLO finds everyone
+        # each frame; her box is the one her face is in (every quarter second), else the one that
+        # continues her last box and has her colours; a stranger's face in her box sends the
+        # circle back to where her face last was.
+        one = None
+        every = max(1, int(round(fps * face_every)))
+        fixes, next_i = 0, skip
+        last_her, doubted = None, False
+        from tqdm.auto import tqdm
+        bar = tqdm(total=total - skip, unit='프레임')
+        report(skip, total, None)
+
+        def box_iou(a, b):
+            ix = max(0, min(a[2], b[2]) - max(a[0], b[0])); iy = max(0, min(a[3], b[3]) - max(a[1], b[1]))
+            i_ = ix * iy
+            return i_ / ((a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - i_ + 1e-9)
+
+        def hist_of(b, bgr):
+            x0, x1 = int(b[0] + (b[2] - b[0]) * 0.25), int(b[2] - (b[2] - b[0]) * 0.25)
+            y0, y1 = int(b[1] + (b[3] - b[1]) * 0.2), int(b[3] - (b[3] - b[1]) * 0.2)
+            patch = bgr[max(0, y0):max(1, y1):3, max(0, x0):max(1, x1):3][:, :, ::-1].reshape(-1, 3) >> 6
+            h = np.bincount(patch[:, 0] * 16 + patch[:, 1] * 4 + patch[:, 2], minlength=64).astype(np.float32)
+            return h / max(1, h.sum())
+
+        alike = lambda a, b: float(np.sqrt(a * b).sum())
+        box = None
+        if pick is not None and pick.get('box'):
+            b = pick['box']
+            box = [b[0] * W, b[1] * H, b[2] * W, b[3] * H]
+        elif first[1] is not None:  # found by face in this notebook
+            box = None
+        her_box, her_hist, frozen, vel = box, None, False, [0.0, 0.0]
+        tap = (pick['tap'][0] * W, pick['tap'][1] * H) if pick is not None else None
+        area = lambda b: (b[2] - b[0]) * (b[3] - b[1])
+        for i in range(skip, total):
+            if cancelled and cancelled():
+                ff.stdin.close(); ff.wait()
+                raise Stopped('취소됐어요')
+            if should_stop and should_stop() and i > skip:
+                break
+            bgr = frames.get(i)
+            res = detector(bgr, classes=[0], conf=0.3, verbose=False)[0]
+            boxes = [list(map(float, b)) for b in res.boxes.xyxy.cpu().numpy()]
+            choice = None
+            if box is None:
+                if tap is not None:
+                    inside = [b for b in boxes if b[0] < tap[0] < b[2] and b[1] < tap[1] < b[3]]
+                    choice = min(inside, key=area) if inside else None
+                elif first[1] is not None:
+                    her0 = first[1]
+                    fx, fy = (her0['box'][0] + her0['box'][2]) / 2, (her0['box'][1] + her0['box'][3]) / 2
+                    inside = [b for b in boxes if b[0] < fx < b[2] and b[1] < fy < b[1] + (b[3] - b[1]) * 0.45]
+                    choice = min(inside, key=area) if inside else None
+            if her_face is not None and i % every == 0:
+                found, her = look(bgr)
+                in_box = lambda f, b: b[0] < (f['box'][0] + f['box'][2]) / 2 < b[2] and b[1] < (f['box'][1] + f['box'][3]) / 2 < b[1] + (b[3] - b[1]) * 0.45
+                if her is not None:
+                    last_her = ((her['box'][0] + her['box'][2]) / 2, (her['box'][1] + her['box'][3]) / 2, her['box'][2] - her['box'][0], i)
+                    doubted = False
+                    mine = [b for b in boxes if in_box(her, b)]
+                    if mine:
+                        m = min(mine, key=area)
+                        if box is not None and box_iou(m, box) < 0.3:
                             fixes += 1
-                            break
-                    elif strangers:
+                        choice, her_box, frozen = m, m, False
+                        h = hist_of(m, bgr)
+                        her_hist = h if her_hist is None else her_hist * 0.7 + h * 0.3
+                elif box is not None:
+                    strangers = [f for f in found if her_face.other(f) and frontal(f) and f['size'] > max(W, H) * 0.024 and in_box(f, box)]
+                    if strangers:
                         near = lambda f: last_her is not None and i - last_her[3] <= fps and math.hypot((f['box'][0] + f['box'][2]) / 2 - last_her[0], (f['box'][1] + f['box'][3]) / 2 - last_her[1]) < 1.5 * last_her[2]
                         if all(near(f) for f in strangers) and not doubted:
                             doubted = True
-                        else:
-                            hide = True
+                        elif her_box is not None:
+                            box, vel, frozen = list(her_box), [0.0, 0.0], True
+                            fixes += 1
                     else:
                         doubted = False
-
-                write(i, core, hide)
-                next_i = i + 1
-                bar.update(1)
-                report(next_i, total, None)
-                frames.forget_before(i)
-            predictor.reset_state(state)
-        if restart is None:
-            break
-        i0, prompt = restart
+            if her_hist is None and (choice or box):
+                her_hist = hist_of(choice or box, bgr)
+            if choice is None and box is not None and not frozen:
+                guess = [box[0] + vel[0], box[1] + vel[1], box[2] + vel[0], box[3] + vel[1]]
+                best = 0.25
+                for b in boxes:
+                    sc = box_iou(b, guess)
+                    if sc > best and (her_hist is None or alike(hist_of(b, bgr), her_hist) > 0.6):
+                        choice, best = b, sc
+            if choice is not None:
+                if box is not None:
+                    dx = (choice[0] + choice[2] - box[0] - box[2]) / 2; dy = (choice[1] + choice[3] - box[1] - box[3]) / 2
+                    vel = [vel[0] * 0.5 + dx * 0.5, vel[1] * 0.5 + dy * 0.5]
+                box = [box[k] + (choice[k] - box[k]) * 0.6 for k in range(4)] if box is not None and box_iou(choice, box) > 0.3 else list(choice)
+            else:
+                vel = [vel[0] * 0.8, vel[1] * 0.8]
+            core = np.zeros((H, W), bool)
+            if box is not None:
+                core[max(0, int(box[1])):min(H, int(box[3]) + 1), max(0, int(box[0])):min(W, int(box[2]) + 1)] = True
+            write(i, core if box is not None else None, False)
+            next_i = i + 1
+            bar.update(1)
+            report(next_i, total, None)
+            frames.forget_before(i)
     written = next_i - skip
     frames.close()
     bar.close()
     ff.stdin.close()
     ff.wait()
-    shutil.rmtree(one, ignore_errors=True)
+    if one:
+        shutil.rmtree(one, ignore_errors=True)
     print(f'얼굴로 {fixes}번 다시 잡았어요.')
 
     # Crop the empty space around her (both halves alike), like the app's player does.
@@ -633,6 +746,6 @@ if __name__ == '__main__':
     ap.add_argument('--start', type=float, default=0); ap.add_argument('--end', type=float)
     ap.add_argument('--fps', type=int, default=30); ap.add_argument('--max-side', type=int, default=1280)
     ap.add_argument('--shape', default='cutout'); ap.add_argument('--sam', default='base_plus')
-    ap.add_argument('--chunk', type=int, default=300)
+    ap.add_argument('--chunk', type=int, default=300); ap.add_argument('--tracker', default='sam')
     a = ap.parse_args()
-    make_clip(a.video, a.out_dir, a.name, a.photos, a.start, a.end, a.fps, a.max_side, a.shape, a.sam, a.chunk)
+    make_clip(a.video, a.out_dir, a.name, a.photos, a.start, a.end, a.fps, a.max_side, a.shape, a.sam, a.chunk, tracker=a.tracker)

@@ -39,7 +39,7 @@ cells = [
 !nvidia-smi --query-gpu=name,memory.total --format=csv || echo "GPU가 없어요: 런타임 → 런타임 유형 변경 → T4 GPU"
 import os
 os.environ['SAM2_BUILD_CUDA'] = '0'  # skip the optional CUDA extension (slow to build, not needed)
-!pip -q install sam2 yt-dlp onnxruntime-gpu
+!pip -q install sam2 yt-dlp onnxruntime-gpu ultralytics
 """),
     md('## 2. 구글 드라이브 연결'),
     py("""
@@ -57,6 +57,8 @@ START = 0  #@param {type:"number"}
 END = 0  #@param {type:"number"}
 #@markdown ↑ 초 단위, END가 0이면 끝까지
 SHAPE = '누끼'  #@param ["누끼", "원"]
+TRACKER = '빠름 (YOLO)'  #@param ["빠름 (YOLO)", "정확 (SAM 2)"]
+#@markdown ↑ 원 모드에서만 써요
 QUALITY = '고화질 (긴 변 1280)'  #@param ["보통 (긴 변 960)", "고화질 (긴 변 1280)", "FHD (긴 변 1920)"]
 FPS = 30  #@param [24, 30, 60] {type:"raw"}
 SAM_MODEL = 'auto'  #@param ["auto", "tiny", "small", "base_plus", "large"]
@@ -92,7 +94,8 @@ if video.startswith('http'):
 photos = sorted(p for p in glob.glob(os.path.join(PHOTOS_FOLDER, '*')) if p.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))) if PHOTOS_FOLDER else []
 max_side = {'보통 (긴 변 960)': 960, '고화질 (긴 변 1280)': 1280, 'FHD (긴 변 1920)': 1920}[QUALITY]
 out = fancam.make_clip(video, OUT_FOLDER, name=NAME, photos=photos, start=float(START), end=float(END) or None,
-                       fps=int(FPS), max_side=max_side, shape='circle' if SHAPE == '원' else 'cutout', sam_model=SAM_MODEL)
+                       fps=int(FPS), max_side=max_side, shape='circle' if SHAPE == '원' else 'cutout', sam_model=SAM_MODEL,
+                       tracker='yolo' if TRACKER.startswith('빠름') else 'sam')
 """),
     md("""
 ## 6. 앱에 넣기
