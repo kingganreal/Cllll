@@ -63,11 +63,18 @@ def worker():
             def progress(done, total, stage=None):
                 job.update(done=done, total=total, stage=stage)
 
-            r = fancam.make_clip(
-                src, job['dir'], name=p.get('name') or '클립', start=float(p.get('start', 0)), end=p.get('end'),
-                fps=int(p.get('fps', 30)), max_side=int(p.get('maxSide', 1280)), shape=p.get('shape', 'cutout'),
-                sam_model=p.get('sam') or os.environ.get('FANCAM_SAM', 'auto'), tracker=p.get('tracker') or 'sam', ref=p.get('faceRef'), pick=p.get('pick'),
-                on_progress=progress, should_stop=lambda: job['stop'], cancelled=lambda: job['state'] == 'cancelled')
+            common = dict(name=p.get('name') or '클립', start=float(p.get('start', 0)), end=p.get('end'),
+                          max_side=int(p.get('maxSide', 1280)), ref=p.get('faceRef'), pick=p.get('pick'), on_progress=progress,
+                          should_stop=lambda: job['stop'], cancelled=lambda: job['state'] == 'cancelled')
+            if p.get('shape') == '3d':
+                import body3d
+                r = body3d.make_3d(src, job['dir'], fps=int(p.get('fps3d', 15)), **common)
+                r.update(kind='3d', layout=None, width=None, height=None)
+            else:
+                r = fancam.make_clip(
+                    src, job['dir'], fps=int(p.get('fps', 30)), shape=p.get('shape', 'cutout'),
+                    sam_model=p.get('sam') or os.environ.get('FANCAM_SAM', 'auto'), tracker=p.get('tracker') or 'sam', **common)
+                r.update(kind='clip')
             job['result'] = r
             job['state'] = 'done'
             try:
@@ -162,7 +169,7 @@ class Handler(BaseHTTPRequestHandler):
             if not r:
                 return self.send(409, {'error': '아직 안 끝났어요.'})
             size = os.path.getsize(r['path'])
-            meta = {k: r[k] for k in ('layout', 'width', 'height', 'duration', 'fixes', 'partial')}
+            meta = {k: r.get(k) for k in ('kind', 'layout', 'width', 'height', 'duration', 'fixes', 'partial', 'frames')}
             if sub == '/info':
                 return self.send(200, {'size': size, 'meta': meta})
             rng = re.match(r'bytes=(\d+)-(\d*)', self.headers.get('Range', ''))
@@ -170,7 +177,7 @@ class Handler(BaseHTTPRequestHandler):
             b = min(size - 1, int(rng.group(2))) if rng and rng.group(2) else size - 1
             self.send_response(206 if rng else 200)
             self.cors()
-            self.send_header('Content-Type', 'video/mp4')
+            self.send_header('Content-Type', 'application/octet-stream' if r.get('kind') == '3d' else 'video/mp4')
             self.send_header('Content-Length', str(b - a + 1))
             if rng:
                 self.send_header('Content-Range', f'bytes {a}-{b}/{size}')

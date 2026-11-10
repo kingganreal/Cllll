@@ -6,6 +6,7 @@ import os
 here = os.path.dirname(os.path.abspath(__file__))
 code = open(os.path.join(here, 'fancam.py'), encoding='utf8').read()
 server = open(os.path.join(here, 'server.py'), encoding='utf8').read()
+body3d = open(os.path.join(here, 'body3d.py'), encoding='utf8').read()
 
 
 def md(text):
@@ -67,6 +68,35 @@ OUT_FOLDER = '/content/drive/MyDrive/직캠 스테이지/코랩'
     md('## 4. 처리 코드'),
     py('%%writefile /content/fancam.py\n' + code),
     py('%%writefile /content/server.py\n' + server),
+    py('%%writefile /content/body3d.py\n' + body3d),
+    md("""
+## 4-3D. 3D로 만들 때만 (SAM 3D Body)
+
+3D(춤추는 3D 인형)를 만들 때만 실행하세요. 처음 한 번 3~5분 걸려요.
+
+1. [Hugging Face](https://huggingface.co)에서 [facebook/sam-3d-body-dinov3](https://huggingface.co/facebook/sam-3d-body-dinov3) 사용 신청을 해서 승인받아요.
+2. **Settings → Access Tokens**에서 Read 토큰을 만들어요.
+3. 왼쪽 🔑(보안 비밀)에 이름 `HF_TOKEN`으로 넣거나, 이 칸을 실행할 때 나오는 입력창에 붙여 넣어요.
+"""),
+    py("""
+!pip -q install pytorch-lightning pyrender yacs scikit-image einops timm dill pandas rich hydra-core pyrootutils webdataset networkx==3.2.1 roma joblib loguru optree fvcore xtcocotools jsonlines appdirs chump huggingface_hub
+!pip -q install git+https://github.com/microsoft/MoGe.git
+from huggingface_hub import login
+try:
+    from google.colab import userdata
+    token = userdata.get('HF_TOKEN')
+except Exception:
+    token = None
+if not token:
+    from getpass import getpass
+    token = getpass('Hugging Face 토큰: ')
+login(token=token)
+import sys
+sys.path.insert(0, '/content')
+import body3d
+body3d.estimator()  # 코드와 모델을 받아 둬요 (승인이 안 됐으면 여기서 오류가 나요)
+print('3D 준비 완료')
+"""),
     md("""
 ## 5-A. 앱과 연결해서 쓰기 (추천)
 

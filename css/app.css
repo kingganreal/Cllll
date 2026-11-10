@@ -119,6 +119,10 @@ button, input, select { font: inherit; color: inherit; }
 .hint { margin: 0; font-size: 13px; color: var(--muted); }
 .hint.warn { color: #ffcf7a; }
 .colab summary { cursor: pointer; margin-bottom: 8px; }
+.view3d { display: flex; flex-direction: column; height: 100vh; }
+.view3d[hidden] { display: none; }
+.v3d-host { flex: 1; min-height: 0; background: radial-gradient(ellipse at 50% 35%, #2a2233, #0d0b12 75%); }
+.v3d-hint { text-align: center; padding: 8px 16px 12px; }
 .colab .hint { margin-top: 6px; }
 .colab-state.ok { color: #8fe3a8; }
 .colab-state.warn { color: #ffcf7a; }

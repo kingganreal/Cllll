@@ -175,6 +175,7 @@
             <select id="shape">
               <option value="cutout" selected>누끼 (몸 모양대로)</option>
               <option value="circle">원 (설윤을 따라가는 동그란 창)</option>
+              <option value="3d">3D (춤추는 3D 인형, 코랩 GPU 필요)</option>
             </select>
           </div>
 
@@ -240,6 +241,17 @@
   </section>
 
   <!-- 무대 -->
+  <section id="view-3d" class="view view3d" hidden>
+    <header class="topbar">
+      <button class="btn ghost" type="button" data-nav="library">← 보관함</button>
+      <h1 id="v3d-title" class="topbar-title">3D</h1>
+      <span class="spacer"></span>
+      <button id="v3d-play" class="btn" type="button">일시정지</button>
+    </header>
+    <div id="v3d-host" class="v3d-host"></div>
+    <p class="hint v3d-hint">끌어서 돌리고, 휠이나 두 손가락으로 확대해요.</p>
+  </section>
+
   <section id="view-stage" class="view stage-view" hidden>
     <div id="stage" class="stage">
       <div id="stage-empty" class="stage-empty" hidden>
@@ -285,7 +297,7 @@
     </div>
   </section>
 
-  <input id="import-input" type="file" accept="video/mp4" multiple hidden>
+  <input id="import-input" type="file" accept="video/mp4,.fancam3d" multiple hidden>
   <input id="bg-input" type="file" accept="image/*" hidden>
   <div id="toast" class="toast" role="status" hidden></div>
 </div>
