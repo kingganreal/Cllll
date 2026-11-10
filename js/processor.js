@@ -8,6 +8,7 @@ import { openSource, seekVideo } from './source.js';
 import { gpuWorker, webgpuAvailable } from './gpu.js';
 import * as sam2 from './sam2.js';
 import * as face from './face.js';
+import { iou as boxIou } from './yolo.js';
 
 export { seekVideo as seek };
 
@@ -709,9 +710,11 @@ export async function extract(o) {
   o.onProgress?.({ done: 0, total: 1, elapsed: 0, eta: 0, stage: '준비 중' });
   // The GPU models run in a worker that is shut down if the GPU hangs (see js/gpu.js); whatever
   // fails falls back to the CPU tools below.
-  // The circle only follows where she is (SAM's mask), so it doesn't need the matting model.
-  if (o.shape === 'circle') o = { ...o, useMatting: false };
-  let gpu = (o.useMatting !== false || o.useSam !== false || o.faceRef) && await webgpuAvailable() ? gpuWorker() : null;
+  // The circle only follows where she is, so it doesn't need the matting model; with the fast
+  // tracker (o.tracker 'yolo', the default for it) YOLO boxes stand in for SAM 2 as well.
+  const wantYolo = o.shape === 'circle' && o.tracker !== 'sam';
+  if (o.shape === 'circle') o = { ...o, useMatting: false, ...(wantYolo ? { useSam: false } : {}) };
+  let gpu = (o.useMatting !== false || o.useSam !== false || o.faceRef || wantYolo) && await webgpuAvailable() ? gpuWorker() : null;
   const configure = () => gpu.call('config', [{ samEp: globalThis.__FANCAM_SAM_EP__, recent: globalThis.__FANCAM_SAM_RECENT__ }]).catch(() => {});
   if (gpu) {
     configure();
@@ -734,12 +737,14 @@ export async function extract(o) {
       : await gpu.call('mattingCreate', [aw, ah], { timeout: load }).then(workerMatter).catch(off('matting'));
     const samOk = o.useSam !== false && !gpu.dead && await gpu.call('samLoad', [], { timeout: samLoad }).then(() => true, off('SAM 2'));
     const faceOk = !!o.faceRef && !gpu.dead && await gpu.call('faceLoad', [], { timeout: load }).then(() => true, () => false);
-    return [m, samOk, faceOk];
+    const yoloOk = wantYolo && !gpu.dead && await gpu.call('yoloLoad', [], { timeout: load }).then(() => true, off('YOLO'));
+    return [m, samOk, faceOk, yoloOk];
   };
-  let [source, [matter, samOk, faceOk]] = await Promise.all([
+  let [source, [matter, samOk, faceOk, yoloOk]] = await Promise.all([
     openSource(o.file, video),
-    gpu ? loadGpuModels() : [null, false, false],
+    gpu ? loadGpuModels() : [null, false, false, false],
   ]);
+  let yoloTrack = !!yoloOk; // (without it the pose model follows her instead)
   let samModels = samOk ? gpu : null;
   let faceModels = !o.faceRef ? null
     : faceOk ? { gpu } : await face.load().then(local => ({ local })).catch(off('face check'));
@@ -872,8 +877,9 @@ export async function extract(o) {
       gpu = gpuWorker();
       configure();
       matter = null;
-      gpuRestarting = loadGpuModels().then(([m, samBack, faceBack]) => {
+      gpuRestarting = loadGpuModels().then(([m, samBack, faceBack, yoloBack]) => {
         matter = m;
+        if (wantYolo) yoloTrack = !!yoloBack;
         samRestart = !!samBack;
         if (faceBack && faceModels) faceModels = { ...faceModels, gpu };
         globalThis.__fancamDebug?.push({ restarted: gpuRestarts, matting: !!m, sam: !!samBack, face: !!faceBack });
@@ -928,6 +934,110 @@ export async function extract(o) {
     let offFace = 0; // face checks in a row where the tracker's mask missed her face
 
     const bounds = [1, 1, 0, 0];
+
+    // Circle mode's fast tracker: YOLO finds everyone each frame; her box is the one her face is
+    // in (checked every quarter second), else the one that best continues her last box (where it
+    // was, moved as it was moving) and looks like her (colours: YOLO also finds the cameraman in
+    // black when she's behind him). Her box goes into `alpha`, and the circle centres on it as it
+    // would on a cut-out. A clear stranger's face in her box doesn't blank the circle: it goes back
+    // to where her face last was and waits there for her face.
+    let yoloBox = o.target?.bbox ? [...o.target.bbox] : null, yoloVel = [0, 0], yoloLost = 0;
+    let herBox = yoloBox, herHist = null, frozen = false;
+    // Colours in the middle of a box (her dress and arms, not the background at its edges).
+    const histOf = (b, px) => {
+      const h = new Float32Array(64);
+      const x0 = Math.floor((b[0] + (b[2] - b[0]) * 0.25) * aw), x1 = Math.ceil((b[2] - (b[2] - b[0]) * 0.25) * aw);
+      const y0 = Math.floor((b[1] + (b[3] - b[1]) * 0.2) * ah), y1 = Math.ceil((b[3] - (b[3] - b[1]) * 0.2) * ah);
+      let sum = 0;
+      for (let y = Math.max(0, y0); y < Math.min(ah, y1); y += 3) {
+        for (let x = Math.max(0, x0); x < Math.min(aw, x1); x += 3) {
+          const j = (y * aw + x) * 4;
+          h[(px[j] >> 6) * 16 + (px[j + 1] >> 6) * 4 + (px[j + 2] >> 6)]++; sum++;
+        }
+      }
+      if (sum) for (let k = 0; k < 64; k++) h[k] /= sum;
+      return h;
+    };
+    const alike = (a, b) => { let s = 0; for (let k = 0; k < 64; k++) s += Math.sqrt(a[k] * b[k]); return s; };
+    const learnHist = h => { if (!herHist) herHist = h; else for (let k = 0; k < 64; k++) herHist[k] = herHist[k] * 0.7 + h[k] * 0.3; };
+    const trackWithYolo = async (f, i, px) => {
+      let boxes;
+      try {
+        const copy = px.slice();
+        boxes = (await gpu.call('people', [copy, aw, ah], { timeout: 20000, transfer: [copy.buffer] })).map(p => p.box);
+      } catch (err) {
+        if (err.name === 'AbortError') throw err;
+        console.warn('YOLO failed, following with the pose model:', err);
+        yoloTrack = false;
+        restartGpu(err);
+        return false;
+      }
+      const area = b => (b[2] - b[0]) * (b[3] - b[1]);
+      let pick = null;
+      if (!yoloBox && o.tap) {
+        const [tx, ty] = o.tap;
+        pick = boxes.filter(b => tx > b[0] && tx < b[2] && ty > b[1] && ty < b[3]).sort((a, b) => area(a) - area(b))[0] || null;
+      }
+      if (faceModels && i % faceEvery === 0) {
+        const { found, her } = await lookForFaces(f);
+        lastFace = { i, found, her };
+        check();
+        // a face belongs to a box when it sits in the box's upper part
+        const inBox = (fc, b) => {
+          const x = (fc.box[0] + fc.box[2]) / 2 / r.w, y = (fc.box[1] + fc.box[3]) / 2 / r.h;
+          return x > b[0] && x < b[2] && y > b[1] && y < b[1] + (b[3] - b[1]) * 0.45;
+        };
+        if (her) {
+          sawHer(her, i);
+          const mine = boxes.filter(b => inBox(her, b)).sort((a, b) => area(a) - area(b))[0];
+          if (mine) {
+            if (yoloBox && boxIou(mine, yoloBox) < 0.3) faceFixes++;
+            pick = mine;
+            herBox = mine;
+            learnHist(histOf(mine, px));
+            frozen = false;
+          }
+        } else if (yoloBox) {
+          const strangers = found.filter(fc => herFace.other(fc) && clearFace(fc, faceMin * 2) && inBox(fc, yoloBox));
+          if (strangers.length && hideFor(strangers, i) && herBox) {
+            // following someone else: back to where her face last was, and wait there
+            yoloBox = [...herBox];
+            yoloVel = [0, 0];
+            frozen = true;
+            faceFixes++;
+          } else if (!strangers.length) doubted = false;
+        }
+      }
+      if (!herHist && (pick || yoloBox)) learnHist(histOf(pick || yoloBox, px)); // her colours from the pick
+      if (!pick && yoloBox && !frozen) {
+        const guess = [yoloBox[0] + yoloVel[0], yoloBox[1] + yoloVel[1], yoloBox[2] + yoloVel[0], yoloBox[3] + yoloVel[1]];
+        let bestScore = 0.25;
+        for (const b of boxes) {
+          const sc = boxIou(b, guess);
+          if (sc > bestScore && (!herHist || alike(histOf(b, px), herHist) > 0.6)) { pick = b; bestScore = sc; }
+        }
+      }
+      if (pick) {
+        if (yoloBox) {
+          const dx = (pick[0] + pick[2] - yoloBox[0] - yoloBox[2]) / 2, dy = (pick[1] + pick[3] - yoloBox[1] - yoloBox[3]) / 2;
+          yoloVel = [yoloVel[0] * 0.5 + dx * 0.5, yoloVel[1] * 0.5 + dy * 0.5];
+        }
+        // ease the box itself (it jumps when an arm goes up or a leg is hidden)
+        yoloBox = yoloBox && boxIou(pick, yoloBox) > 0.3 ? pick.map((v, k) => yoloBox[k] + (v - yoloBox[k]) * 0.6) : [...pick];
+        yoloLost = 0;
+      } else {
+        yoloLost++;
+        yoloVel = [yoloVel[0] * 0.8, yoloVel[1] * 0.8];
+      }
+      alpha.fill(0);
+      // Lost or waiting: the circle stays where she was rather than going blank.
+      const shown = !!yoloBox;
+      if (shown) {
+        const x0 = Math.floor(yoloBox[0] * aw), x1 = Math.ceil(yoloBox[2] * aw), y0 = Math.floor(yoloBox[1] * ah), y1 = Math.ceil(yoloBox[3] * ah);
+        for (let y = Math.max(0, y0); y < Math.min(ah, y1); y++) alpha.fill(1, y * aw + Math.max(0, x0), y * aw + Math.min(aw, x1));
+      }
+      return shown;
+    };
 
     // Circle mode: follow the middle of her cut-out (upper body weighs more than legs, so the
     // circle sits around her torso) with a radius fitted to her size, both eased so the window
@@ -1021,6 +1131,10 @@ export async function extract(o) {
         await breathe(); check();
         mark('read');
 
+        if (yoloTrack) {
+          found = await trackWithYolo(f, i, px);
+          mark('yolo');
+        }
         let samStarted = false;
         if (!sam && samRestart && i % samEvery === 0) {
           // The GPU models are back after a restart: start tracking her again, from her face if it
@@ -1151,7 +1265,7 @@ export async function extract(o) {
             guided(guide, samRegion.core, radius, 0.004, refined);
             for (let k = 0; k < n; k++) { const v = (refined[k] - 0.3) / 0.4; alpha[k] = v < 0 ? 0 : v > 1 ? 1 : v; }
           }
-        } else {
+        } else if (!yoloTrack) {
           const persons = await detect(aCanvas);
           await breathe(); check();
           let person = persons.length && persons[0].w === aw ? tracker.update(persons, px) : (tracker.lost++, null);

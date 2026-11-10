@@ -3,6 +3,7 @@
 import * as matting from './matting.js';
 import * as sam2 from './sam2.js';
 import * as face from './face.js';
+import * as yolo from './yolo.js';
 
 let trust = {};
 sam2.setTrustStore({
@@ -10,7 +11,7 @@ sam2.setTrustStore({
   set: v => { trust = v; postMessage({ type: 'trust', value: v }); },
 });
 
-let matter = null, samModels = null, tracker = null, faceModels = null;
+let matter = null, samModels = null, tracker = null, faceModels = null, yoloModel = null;
 
 // SAM output for the page: the mask logits (transferred) and the score.
 const samOut = out => ({ value: { low: out.low, score: out.score, iou: out.iou }, transfer: [out.low.buffer] });
@@ -51,6 +52,8 @@ const methods = {
   async samNext(input) { return samOut(await tracker.next(input)); },
 
   async faceLoad() { faceModels = await face.load(); return true; },
+  async yoloLoad() { yoloModel = await yolo.load(); return true; },
+  people(rgba, w, h) { return yolo.people(yoloModel, rgba, w, h); },
   async faces(bitmap, w, h, minSize) {
     try {
       const found = await face.faces(faceModels, ctx => ctx.drawImage(bitmap, 0, 0), w, h, { minSize });

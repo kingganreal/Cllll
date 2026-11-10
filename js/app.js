@@ -686,7 +686,11 @@ const colabBox = {
     this.check();
   },
 };
-$('#shape').addEventListener('change', () => { try { localStorage.setItem('fancam-shape', $('#shape').value); } catch {} });
+$('#shape').addEventListener('change', () => {
+  try { localStorage.setItem('fancam-shape', $('#shape').value); } catch {}
+  $('#tracker-row').hidden = $('#shape').value !== 'circle';
+});
+$('#tracker').addEventListener('change', () => { try { localStorage.setItem('fancam-tracker', $('#tracker').value); } catch {} });
 $('#colab-url').addEventListener('change', () => { colab.save($('#colab-url').value); colabBox.check(); });
 
 $('#faces-input').addEventListener('change', e => {
@@ -712,7 +716,11 @@ const create = {
 
   enter() {
     colabBox.show();
-    try { $('#shape').value = localStorage.getItem('fancam-shape') || 'cutout'; } catch {}
+    try {
+      $('#shape').value = localStorage.getItem('fancam-shape') || 'cutout';
+      $('#tracker').value = localStorage.getItem('fancam-tracker') || 'yolo';
+    } catch {}
+    $('#tracker-row').hidden = $('#shape').value !== 'circle';
     $('#faces').hidden = !FACE_ENABLED;
     if (FACE_ENABLED) faces.render();
     // "새 클립 만들기" always starts from an empty page, not the last video.
@@ -904,7 +912,7 @@ const create = {
     const box = t?.bbox ? [...full([t.bbox[0], t.bbox[1]]), ...full([t.bbox[2], t.bbox[3]])] : null;
     const { blob, meta } = await colab.extract(opts.file, {
       name, start: opts.start, end: opts.end, fps: opts.fps, maxSide: opts.maxSide, shape: opts.shape,
-      url: this.sourceUrl || null,
+      tracker: opts.tracker, url: this.sourceUrl || null,
       faceRef: opts.faceRef ? Array.from(opts.faceRef) : null, pick: { tap: full(tap), box },
     }, {
       stop: opts.stop, signal: opts.signal,
@@ -983,7 +991,7 @@ const create = {
       file: this.file, video: v, start: this.start, end: this.end, target: this.target, rect: this.rect(),
       tap: this.tap, others: this.persons, stop: (this.stopFlag = { requested: false }),
       useSam: SAM_ENABLED, faceRef: await faces.reference(), faceSeed: this.tapped ? null : this.faceSeed,
-      fps: Number($('#fps').value), maxSide: Number($('#quality').value), shape: $('#shape').value,
+      fps: Number($('#fps').value), maxSide: Number($('#quality').value), shape: $('#shape').value, tracker: $('#tracker').value,
       withAudio: $('#with-audio').checked,
     };
     // ~3.7 Mbps at 960, ~6.5 at 1280, ~15 at 1920 (30fps): the cut-out's edges need the bits.
