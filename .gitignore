@@ -1,3 +1,5 @@
 .tmp-test/
 .tmp-test/
 .claude/
+__pycache__/
+*.pyc
