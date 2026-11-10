@@ -27,7 +27,7 @@ cells = [
 코랩의 GPU로 돌려서 노트북 PC보다 훨씬 빠르고, 더 큰 모델(SAM 2.1 base+, RVM ResNet-50)을 써서 더 정확해요.
 
 **쓰는 법**
-1. 위 메뉴 **런타임 → 런타임 유형 변경 → T4 GPU**를 골라요.
+1. 위 메뉴 **런타임 → 런타임 유형 변경**에서 GPU(T4, L4, A100 중 하나)를 골라요.
 2. 아래 칸을 위에서부터 차례로 ▶ 눌러 실행해요. (**런타임 → 모두 실행**도 돼요.)
 3. 다 되면 내 구글 드라이브의 **직캠 스테이지/코랩** 폴더에 파일이 생겨요.
    PC나 폰에서 받아서 앱의 **파일 가져오기**로 넣으면 끝이에요.
@@ -107,7 +107,9 @@ out = fancam.make_clip(video, OUT_FOLDER, name=NAME, photos=photos, start=float(
 
 nb = {
     'nbformat': 4, 'nbformat_minor': 0,
-    'metadata': {'colab': {'provenance': [], 'gpuType': 'T4'}, 'accelerator': 'GPU',
+    # No gpuType here: a fixed one would undo the GPU the user picked (A100, L4…) every time a
+    # new copy of the notebook is uploaded. accelerator just asks for some GPU.
+    'metadata': {'colab': {'provenance': []}, 'accelerator': 'GPU',
                  'kernelspec': {'name': 'python3', 'display_name': 'Python 3'}, 'language_info': {'name': 'python'}},
     'cells': cells,
 }
