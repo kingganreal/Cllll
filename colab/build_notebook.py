@@ -131,7 +131,7 @@ out = fancam.make_clip(video, OUT_FOLDER, name=NAME, photos=photos, start=float(
 ## 6. 앱에 넣기
 
 드라이브의 **직캠 스테이지/코랩** 폴더에서 `이름.stage-….mp4` 파일을 받아, 앱 보관함의 **파일 가져오기**로 열면 돼요.
-이름 끝의 `.stage-tb`/`.stage-sbs`는 앱이 파일을 읽는 데 필요하니 바꾸지 마세요.
+이름 끝의 `.stage-tb`/`.stage-sbs`/`.stage-circle`은 앱이 파일을 읽는 데 필요하니 바꾸지 마세요.
 """),
 ]
 

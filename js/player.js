@@ -1,4 +1,7 @@
 // Plays an alpha-packed clip (see processor.js) as a transparent, animated sprite.
+// Layouts: 'sbs' / 'tb' = colour and alpha side by side / stacked; 'circle' = the picture alone
+// (full size, up to 4K) with a 16 px strip under it saying whether she's shown (white) or hidden
+// (black); the round mask is drawn here.
 const VERT = `
 attribute vec2 p;
 varying vec2 v;
@@ -9,13 +12,22 @@ precision mediump float;
 varying vec2 v;
 uniform sampler2D tex;
 uniform vec4 crop;     // x, y, w, h inside one half (0..1)
-uniform float layout;  // 0 = side-by-side, 1 = top/bottom
+uniform float layout;  // 0 = side-by-side, 1 = top/bottom, 2 = circle
+uniform float cfrac;   // circle: the picture's share of the frame height
 uniform float flip;
 uniform vec2 texel;    // half a texel, keeps samples away from the seam
 void main() {
   vec2 uv = v;
   if (flip > 0.5) uv.x = 1.0 - uv.x;
   uv = crop.xy + uv * crop.zw;
+  if (layout > 1.5) {
+    vec3 col = texture2D(tex, vec2(uv.x, min(uv.y * cfrac, cfrac - texel.y))).rgb;
+    float shown = step(0.5, texture2D(tex, vec2(0.5, (1.0 + cfrac) * 0.5)).r);
+    float px = 2.0 * texel.x;
+    float al = shown * (1.0 - smoothstep(0.5 - 3.0 * px, 0.5 - px, length(uv - 0.5)));
+    gl_FragColor = vec4(col * al, al);
+    return;
+  }
   vec2 cu, au;
   if (layout < 0.5) {
     uv.x = clamp(uv.x * 0.5, texel.x, 0.5 - texel.x);
@@ -29,6 +41,9 @@ void main() {
   a = smoothstep(0.04, 0.96, a);
   gl_FragColor = vec4(c * a, a);
 }`;
+
+/** Rows under the picture in a 'circle' clip (white = she's shown). */
+export const CIRCLE_STRIP = 16;
 
 export class AlphaClip {
   /**
@@ -89,11 +104,14 @@ export class AlphaClip {
       layout: gl.getUniformLocation(prog, 'layout'),
       flip: gl.getUniformLocation(prog, 'flip'),
       texel: gl.getUniformLocation(prog, 'texel'),
+      cfrac: gl.getUniformLocation(prog, 'cfrac'),
     };
     const { crop, layout, width, height } = this.clip;
     gl.uniform4f(this.u.crop, crop.x, crop.y, crop.w, crop.h);
-    gl.uniform1f(this.u.layout, layout === 'tb' ? 1 : 0);
-    const W = layout === 'sbs' ? width * 2 : width, H = layout === 'sbs' ? height : height * 2;
+    gl.uniform1f(this.u.layout, layout === 'circle' ? 2 : layout === 'tb' ? 1 : 0);
+    const W = layout === 'sbs' ? width * 2 : width;
+    const H = layout === 'sbs' ? height : layout === 'circle' ? height + CIRCLE_STRIP : height * 2;
+    gl.uniform1f(this.u.cfrac, height / H);
     gl.uniform2f(this.u.texel, 0.5 / W, 0.5 / H);
     gl.clearColor(0, 0, 0, 0);
   }

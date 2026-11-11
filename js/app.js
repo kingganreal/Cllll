@@ -254,14 +254,14 @@ async function importClip(file) {
   v.src = URL.createObjectURL(file);
   try {
     await new Promise((res, rej) => { v.onloadeddata = res; v.onerror = () => rej(new Error('영상을 열 수 없어요')); });
-    const m = file.name.match(/\.stage-(sbs|tb)\.mp4$/i);
+    const m = file.name.match(/\.stage-(sbs|tb|circle)\.mp4$/i);
     const layout = m ? m[1].toLowerCase() : (v.videoWidth >= v.videoHeight ? 'sbs' : 'tb');
     const width = layout === 'sbs' ? v.videoWidth / 2 : v.videoWidth;
-    const height = layout === 'sbs' ? v.videoHeight : v.videoHeight / 2;
+    const height = layout === 'sbs' ? v.videoHeight : layout === 'circle' ? v.videoHeight - 16 : v.videoHeight / 2;
     v.currentTime = Math.min(1, v.duration / 3);
     await new Promise(r => { v.onseeked = r; });
     const thumbnail = await packedThumbnail(v, layout, width, height);
-    const name = file.name.replace(/(\.stage-(sbs|tb))?\.mp4$/i, '');
+    const name = file.name.replace(/(\.stage-(sbs|tb|circle))?\.mp4$/i, '');
     await clips.put({
       id: uid(), name, created: Date.now(), blob: file, thumbnail, layout,
       crop: { x: 0, y: 0, w: 1, h: 1 }, width, height, duration: v.duration, hasAudio: true,
@@ -291,6 +291,11 @@ function packedThumbnail(v, layout, width, height) {
   const w = Math.round(width * s), h = Math.round(height * s);
   const c = document.createElement('canvas'); c.width = w; c.height = h;
   const ctx = c.getContext('2d', { willReadFrequently: true });
+  if (layout === 'circle') { // the picture, cut round (see player.js)
+    ctx.beginPath(); ctx.arc(w / 2, h / 2, Math.min(w, h) / 2, 0, Math.PI * 2); ctx.clip();
+    ctx.drawImage(v, 0, 0, width, height, 0, 0, w, h);
+    return new Promise(r => c.toBlob(r, 'image/png'));
+  }
   const ax = layout === 'sbs' ? width : 0, ay = layout === 'sbs' ? 0 : height;
   ctx.drawImage(v, ax, ay, width, height, 0, 0, w, h);
   const a = ctx.getImageData(0, 0, w, h);

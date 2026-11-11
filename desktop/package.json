@@ -1,7 +1,7 @@
 {
   "name": "fancam-stage-desktop",
   "productName": "FancamStage",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "직캠 스테이지 윈도우 앱: 클립을 바탕화면에 띄우고, 유튜브 원본을 받아요",
   "main": "main.js",
   "author": "kingganreal",

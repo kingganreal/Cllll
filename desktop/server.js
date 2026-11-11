@@ -80,7 +80,7 @@ function start({ appVersion, onClipsChanged, onShow }) {
         await pipeline(req, fs.createWriteStream(tmp));
         fs.renameSync(tmp, store.clipPath(clipId, 'mp4'));
         store.saveMeta({
-          id: clipId, name: String(meta.name || '클립'), layout: meta.layout === 'tb' ? 'tb' : 'sbs',
+          id: clipId, name: String(meta.name || '클립'), layout: ['tb', 'circle'].includes(meta.layout) ? meta.layout : 'sbs',
           crop: meta.crop || { x: 0, y: 0, w: 1, h: 1 }, width: Number(meta.width) || 0, height: Number(meta.height) || 0,
           duration: Number(meta.duration) || 0, hasAudio: !!meta.hasAudio, received: Date.now(),
           created: Number(meta.created) || Date.now(), fps: Number(meta.fps) || 0, codec: String(meta.codec || ''),

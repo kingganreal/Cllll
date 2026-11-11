@@ -509,13 +509,17 @@ def make_clip(video, out_dir, name='설윤', photos=(), start=0.0, end=None, fps
         predictor = build_sam2_video_predictor(cfg, fetch(url), device=DEVICE)
 
     # Output: colour and alpha packed like the app does (side by side for portrait, else stacked).
+    # The circle keeps the source's full size (4K stays 4K): just the picture, with a 16 px strip
+    # under it saying whether she's shown (js/player.js draws the round mask).
     if shape == 'circle':
-        side = even(min(vw, vh, 1080))  # from the original frames, whatever the working size
+        side = even(min(vw, vh))  # from the original frames, whatever the working size
         ow, oh = side, side
+        layout = 'circle'
+        PW, PH = ow, oh + 16
     else:
         ow, oh = W, H
-    layout = 'sbs' if oh >= ow else 'tb'
-    PW, PH = (ow * 2, oh) if layout == 'sbs' else (ow, oh * 2)
+        layout = 'sbs' if oh >= ow else 'tb'
+        PW, PH = (ow * 2, oh) if layout == 'sbs' else (ow, oh * 2)
     os.makedirs(out_dir, exist_ok=True)
     safe = ''.join('_' if c in '\\/:*?"<>|' else c for c in name)
     tmp_out = os.path.join(out_dir, f'.{safe}.tmp.mp4')
@@ -527,7 +531,7 @@ def make_clip(video, out_dir, name='설윤', photos=(), start=0.0, end=None, fps
         'ffmpeg', '-y', '-loglevel', 'error',
         '-f', 'rawvideo', '-pix_fmt', 'bgr24', '-s', f'{PW}x{PH}', '-r', str(fps), '-i', '-',
         '-ss', f'{first_t:.3f}', '-t', f'{end - first_t:.3f}', '-i', video,
-        '-map', '0:v', '-map', '1:a?', '-c:v', 'libx264', '-crf', '22', '-preset', 'faster', '-pix_fmt', 'yuv420p',
+        '-map', '0:v', '-map', '1:a?', '-c:v', 'libx264', '-crf', '18' if shape == 'circle' else '20', '-preset', 'faster', '-pix_fmt', 'yuv420p',
         '-c:a', 'aac', '-b:a', '192k', '-shortest',
         *(['-movflags', 'frag_keyframe+empty_moov+default_base_moof', '-frag_duration', '1000000'] if streaming else ['-movflags', '+faststart']),
         '-f', 'mp4', 'pipe:1' if streaming else tmp_out,
@@ -605,7 +609,9 @@ def make_clip(video, out_dir, name='설윤', photos=(), start=0.0, end=None, fps
                 bounds[2] = max(bounds[2], xs.max() * 2 / W); bounds[3] = max(bounds[3], ys.max() * 2 / H)
         a8 = (alpha * 255).astype(np.uint8)
         packed = np.zeros((PH, PW, 3), np.uint8)
-        if layout == 'sbs':
+        if layout == 'circle':
+            packed[:oh] = colour; packed[oh:] = 0 if hidden else 255
+        elif layout == 'sbs':
             packed[:, :ow] = colour; packed[:, ow:] = a8[..., None]
         else:
             packed[:oh] = colour; packed[oh:] = a8[..., None]
@@ -755,7 +761,7 @@ def make_clip(video, out_dir, name='설윤', photos=(), start=0.0, end=None, fps
         else:
             fc = f'[0:v]split[a][b];[a]crop={cw}:{ch}:{cx}:{cy}[c];[b]crop={cw}:{ch}:{cx}:{oh + cy}[d];[c][d]vstack[v]'
         subprocess.run(['ffmpeg', '-y', '-loglevel', 'error', '-i', tmp_out, '-filter_complex', fc, '-map', '[v]', '-map', '0:a?',
-                        '-c:v', 'libx264', '-crf', '22', '-preset', 'faster', '-pix_fmt', 'yuv420p', '-c:a', 'copy',
+                        '-c:v', 'libx264', '-crf', '20', '-preset', 'faster', '-pix_fmt', 'yuv420p', '-c:a', 'copy',
                         '-movflags', '+faststart', final], check=True)
         os.remove(tmp_out)
     else:
@@ -765,7 +771,7 @@ def make_clip(video, out_dir, name='설윤', photos=(), start=0.0, end=None, fps
     fw, fh = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     cap.release()
     return {'path': final, 'layout': layout, 'width': fw // 2 if layout == 'sbs' else fw,
-            'height': fh if layout == 'sbs' else fh // 2, 'duration': written / fps, 'fixes': fixes,
+            'height': fh if layout == 'sbs' else fh - 16 if layout == 'circle' else fh // 2, 'duration': written / fps, 'fixes': fixes,
             'partial': written < total - skip}
 
 
