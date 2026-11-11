@@ -15,6 +15,7 @@ import math
 import os
 import shutil
 import subprocess
+import threading
 import urllib.request
 import zipfile
 
@@ -395,7 +396,8 @@ class Stopped(Exception):
 
 def make_clip(video, out_dir, name='설윤', photos=(), start=0.0, end=None, fps=30, max_side=1280,
               shape='cutout', sam_model='auto', chunk=300, face_every=0.25, crop=True,
-              ref=None, pick=None, on_progress=None, should_stop=None, cancelled=None, tracker='sam'):
+              ref=None, pick=None, on_progress=None, should_stop=None, cancelled=None, tracker='sam',
+              on_output=None):
     """Makes the clip; returns {'path', 'layout', 'width', 'height', 'duration', 'fixes'}.
 
     From the app (colab/server.py): `ref` is her face (the registered photos' average embedding,
@@ -518,13 +520,32 @@ def make_clip(video, out_dir, name='설윤', photos=(), start=0.0, end=None, fps
     safe = ''.join('_' if c in '\\/:*?"<>|' else c for c in name)
     tmp_out = os.path.join(out_dir, f'.{safe}.tmp.mp4')
     first_t = start + skip / fps
+    # Without a crop pass at the end (circle mode), the clip is written as a fragmented MP4 that only
+    # ever grows, so the app can fetch it while it's being made (on_output gets its path).
+    streaming = shape == 'circle' or not crop
     ff = subprocess.Popen([
         'ffmpeg', '-y', '-loglevel', 'error',
         '-f', 'rawvideo', '-pix_fmt', 'bgr24', '-s', f'{PW}x{PH}', '-r', str(fps), '-i', '-',
         '-ss', f'{first_t:.3f}', '-t', f'{end - first_t:.3f}', '-i', video,
-        '-map', '0:v', '-map', '1:a?', '-c:v', 'libx264', '-crf', '20', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
-        '-c:a', 'aac', '-b:a', '192k', '-shortest', '-movflags', '+faststart', tmp_out,
-    ], stdin=subprocess.PIPE)
+        '-map', '0:v', '-map', '1:a?', '-c:v', 'libx264', '-crf', '22', '-preset', 'faster', '-pix_fmt', 'yuv420p',
+        '-c:a', 'aac', '-b:a', '192k', '-shortest',
+        *(['-movflags', 'frag_keyframe+empty_moov+default_base_moof', '-frag_duration', '1000000'] if streaming else ['-movflags', '+faststart']),
+        '-f', 'mp4', 'pipe:1' if streaming else tmp_out,
+    ], stdin=subprocess.PIPE, stdout=subprocess.PIPE if streaming else None)
+    pump = None
+    if streaming:
+        def copy_out(src=ff.stdout):
+            with open(tmp_out, 'wb') as out:
+                while True:
+                    block = src.read1(1 << 20)
+                    if not block:
+                        break
+                    out.write(block)
+                    out.flush()
+        pump = threading.Thread(target=copy_out, daemon=True)
+        pump.start()
+        if on_output:
+            on_output(tmp_out)
 
     side_px = max(W, H)
     k_area = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * int(side_px * 0.015) + 1,) * 2)
@@ -715,6 +736,8 @@ def make_clip(video, out_dir, name='설윤', photos=(), start=0.0, end=None, fps
     bar.close()
     ff.stdin.close()
     ff.wait()
+    if pump:
+        pump.join()
     if one:
         shutil.rmtree(one, ignore_errors=True)
     print(f'얼굴로 {fixes}번 다시 잡았어요.')
@@ -732,7 +755,7 @@ def make_clip(video, out_dir, name='설윤', photos=(), start=0.0, end=None, fps
         else:
             fc = f'[0:v]split[a][b];[a]crop={cw}:{ch}:{cx}:{cy}[c];[b]crop={cw}:{ch}:{cx}:{oh + cy}[d];[c][d]vstack[v]'
         subprocess.run(['ffmpeg', '-y', '-loglevel', 'error', '-i', tmp_out, '-filter_complex', fc, '-map', '[v]', '-map', '0:a?',
-                        '-c:v', 'libx264', '-crf', '20', '-preset', 'veryfast', '-pix_fmt', 'yuv420p', '-c:a', 'copy',
+                        '-c:v', 'libx264', '-crf', '22', '-preset', 'faster', '-pix_fmt', 'yuv420p', '-c:a', 'copy',
                         '-movflags', '+faststart', final], check=True)
         os.remove(tmp_out)
     else:

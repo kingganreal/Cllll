@@ -1065,7 +1065,7 @@ const create = {
           : info.sam ? 'SAM 2 추적 + GPU 누끼' : info.matting ? 'GPU 고급 누끼' : '기본 누끼')
         + (info.face ? ` + 얼굴 확인${info.fixes ? ` (${info.fixes}번 바로잡음)` : ''}` : '');
       $('#progress-text').textContent =
-        `${info.done} / ${info.total} 프레임 · ${pct.toFixed(0)}% · 남은 시간 약 ${fmtTime(info.eta)}\n${mode}${info.found ? '' : ' · 멤버를 놓쳐서 다시 찾는 중'}`;
+        `${info.done} / ${info.total} 프레임 · ${pct.toFixed(0)}% · 남은 시간 약 ${fmtTime(info.eta)}\n${mode}${info.found ? '' : ' · 멤버를 놓쳐서 다시 찾는 중'}${info.received ? ` · 미리 받은 클립 ${(info.received / 1048576).toFixed(0)}MB` : ''}`;
       const now = performance.now();
       if (now - lastDraw > 250 && info.preview) {
         lastDraw = now;

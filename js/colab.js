@@ -99,6 +99,7 @@ async function run(file, params, { onProgress, stop, signal }) {
   const cancel = () => call(`/jobs/${id}`, { method: 'DELETE' }).catch(() => {});
   signal?.addEventListener('abort', cancel, { once: true });
   const aborted = () => { if (signal?.aborted) throw new DOMException('취소됨', 'AbortError'); };
+  let stopLive = async () => {};
   try {
     // From YouTube: the server downloads it itself (faster than sending a big original from here).
     // A quick tunnel is slow per connection, so the pieces go several at a time.
@@ -111,23 +112,47 @@ async function run(file, params, { onProgress, stop, signal }) {
     });
     await call(`/jobs/${id}/start`, { method: 'POST' });
     const t0 = performance.now();
+    // Circle clips can be fetched while they're being made (the server's /live: a file that only
+    // grows), so little is left to fetch at the end. Other clips answer 204 until they're done.
+    const live = { chunks: [], got: 0, on: true, ctl: null };
+    const liveLoop = (async () => {
+      const wait = ms => new Promise(r => setTimeout(r, ms));
+      while (live.on) {
+        let n = 0;
+        try {
+          live.ctl = new AbortController();
+          const res = await call(`/jobs/${id}/live?from=${live.got}`, { signal: live.ctl.signal });
+          if (res.status === 200) {
+            const reader = res.body.getReader();
+            for (;;) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              live.chunks.push(value); live.got += value.byteLength; n += value.byteLength;
+            }
+          }
+        } catch { /* a cut-off read still leaves a good prefix */ }
+        if (live.on && !n) await wait(2500);
+      }
+    })();
+    stopLive = async () => { live.on = false; live.ctl?.abort(); await liveLoop; };
     let stopSent = false, s;
     for (;;) {
       aborted();
       await new Promise(r => setTimeout(r, 1500));
       if (stop?.requested && !stopSent) { stopSent = true; call(`/jobs/${id}/stop`, { method: 'POST' }).catch(() => {}); }
       s = await (await call(`/jobs/${id}`)).json();
-      if (s.state === 'error') throw new Error(s.error || '코랩에서 처리하지 못했어요.');
-      if (s.state === 'cancelled') throw new DOMException('취소됨', 'AbortError');
+      if (s.state === 'error') { stopLive(); throw new Error(s.error || '코랩에서 처리하지 못했어요.'); }
+      if (s.state === 'cancelled') { stopLive(); throw new DOMException('취소됨', 'AbortError'); }
       if (s.state === 'done') break;
       if (s.state === 'queued') onProgress?.({ stage: '코랩에서 앞 작업이 끝나길 기다리는 중' });
       else if (s.state === 'downloading') onProgress?.({ stage: '코랩이 유튜브에서 영상 받는 중' });
       else if (s.stage || !s.total) onProgress?.({ stage: s.stage || '코랩에서 준비 중' });
       else {
         const elapsed = (performance.now() - t0) / 1000;
-        onProgress?.({ done: s.done, total: s.total, elapsed, eta: s.done ? elapsed / s.done * (s.total - s.done) : 0, fixes: s.fixes });
+        onProgress?.({ done: s.done, total: s.total, elapsed, eta: s.done ? elapsed / s.done * (s.total - s.done) : 0, fixes: s.fixes, received: live.got });
       }
     }
+    await stopLive();
     onProgress?.({ stage: '완성된 클립 받는 중' });
     // Several ranges at once, for the same reason as the upload.
     const info = await call(`/jobs/${id}/info`).then(r => r.json(), () => null);
@@ -137,17 +162,19 @@ async function run(file, params, { onProgress, stop, signal }) {
       return whole;
     }
     const { size, meta } = info;
-    const RANGE = 8 * 1024 * 1024, n = Math.max(1, Math.ceil(size / RANGE)), pieces = new Array(n);
+    if (live.got > size) { live.chunks = []; live.got = 0; } // not the same file after all
+    const from = live.got; // what came while it was being made
+    const RANGE = 8 * 1024 * 1024, n = Math.ceil((size - from) / RANGE), pieces = new Array(n);
     const MB = v => (v / 1048576).toFixed(1);
     const got = new Array(n).fill(0); // bytes so far of each piece (counted as they arrive)
     const show = () => {
-      const sum = got.reduce((x, y) => x + y, 0);
+      const sum = from + got.reduce((x, y) => x + y, 0);
       onProgress?.({ stage: `완성된 클립 받는 중 ${Math.round(sum / size * 100)}% (${MB(sum)} / ${MB(size)}MB)` });
     };
     show();
     await parallel(n, 6, async i => {
       aborted();
-      const a = i * RANGE, b = Math.min(size, a + RANGE) - 1;
+      const a = from + i * RANGE, b = Math.min(size, a + RANGE) - 1;
       pieces[i] = await retry(async () => {
         got[i] = 0;
         const res = await call(`/jobs/${id}/result`, { headers: { Range: `bytes=${a}-${b}` } });
@@ -162,10 +189,11 @@ async function run(file, params, { onProgress, stop, signal }) {
         return new Blob(chunks);
       });
     });
-    const blob = new Blob(pieces, { type: 'video/mp4' });
+    const blob = new Blob([...live.chunks, ...pieces], { type: 'video/mp4' });
     call(`/jobs/${id}`, { method: 'DELETE' }).catch(() => {}); // free the server's disk
     return { blob, meta };
   } finally {
+    stopLive();
     signal?.removeEventListener('abort', cancel);
   }
 }

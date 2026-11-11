@@ -10,6 +10,7 @@ goes into the app together with a random key (every request must carry it). One 
   GET  /jobs/<id>                      {state, done, total, stage, error}
   POST /jobs/<id>/stop                 finish early, keeping what's made (여기까지 저장)
   DELETE /jobs/<id>                    cancel and forget
+  GET  /jobs/<id>/live?from=N          the clip so far while it is made (circle mode), X-Final/X-Size
   GET  /jobs/<id>/info                 the finished clip's size and details
   GET  /jobs/<id>/result               the clip (packed MP4), whole or a Range of it (the app fetches
                                        several ranges at once: a quick tunnel is slow per connection)
@@ -73,7 +74,8 @@ def worker():
             else:
                 r = fancam.make_clip(
                     src, job['dir'], fps=int(p.get('fps', 30)), shape=p.get('shape', 'cutout'),
-                    sam_model=p.get('sam') or os.environ.get('FANCAM_SAM', 'auto'), tracker=p.get('tracker') or 'sam', **common)
+                    sam_model=p.get('sam') or os.environ.get('FANCAM_SAM', 'auto'), tracker=p.get('tracker') or 'sam',
+                    on_output=lambda path: job.update(live=path), **common)
                 r.update(kind='clip')
             job['result'] = r
             job['state'] = 'done'
@@ -98,7 +100,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
         self.send_header('Access-Control-Allow-Headers', 'Content-Type, X-Key, Range')
-        self.send_header('Access-Control-Expose-Headers', 'X-Clip')
+        self.send_header('Access-Control-Expose-Headers', 'X-Clip, X-Final, X-Size')
 
     def send(self, code, obj):
         body = json.dumps(obj, ensure_ascii=False).encode()
@@ -164,6 +166,33 @@ class Handler(BaseHTTPRequestHandler):
             job['state'] = 'cancelled'
             threading.Timer(30, lambda: (jobs.pop(job['id'], None), shutil.rmtree(job['dir'], ignore_errors=True))).start()
             return self.send(200, {'ok': True})
+        if sub == '/live' and method == 'GET':
+            # The clip while it's being made (it only grows): bytes from ?from= to what's written so far.
+            # X-Final: 1 once it's complete (then the bytes up to X-Size are the whole clip).
+            r = job['result']
+            path = r['path'] if r else job.get('live')
+            if not path or not os.path.exists(path):
+                return self.send(204 if job['state'] in ('queued', 'running', 'downloading') else 409, {})
+            a = int((re.search(r'from=(\d+)', self.path) or [0, 0])[1])
+            size = os.path.getsize(path)
+            limit = min(size, a + (16 << 20))
+            self.send_response(200)
+            self.cors()
+            self.send_header('Content-Type', 'application/octet-stream')
+            self.send_header('Content-Length', str(max(0, limit - a)))
+            self.send_header('X-Final', '1' if r else '0')
+            self.send_header('X-Size', str(size))
+            self.end_headers()
+            with open(path, 'rb') as f:
+                f.seek(a)
+                left = limit - a
+                while left > 0:
+                    chunk = f.read(min(left, 1 << 20))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    left -= len(chunk)
+            return
         if sub in ('/result', '/info') and method == 'GET':
             r = job['result']
             if not r:
