@@ -36,6 +36,27 @@ jobs = {}
 work = queue.Queue()
 
 
+DRIVE = '/content/drive/MyDrive'
+DRIVE_DIR = '직캠 스테이지/코랩'
+
+
+def to_drive(job):
+    """A copy in Google Drive (when it's connected, notebook step 2): the tunnel can be very slow,
+    and from Drive the clip comes at full speed (drive.google.com, or Google Drive on the PC)."""
+    if not os.path.isdir(DRIVE):
+        return
+    try:
+        src = job['result']['path']
+        os.makedirs(os.path.join(DRIVE, DRIVE_DIR), exist_ok=True)
+        dst = os.path.join(DRIVE, DRIVE_DIR, os.path.basename(src))
+        shutil.copyfile(src, dst + '.part')
+        os.replace(dst + '.part', dst)
+        job['drive'] = f'{DRIVE_DIR}/{os.path.basename(src)}'
+        print('드라이브에도 저장했어요:', dst)
+    except Exception as err:
+        print('드라이브에 저장하지 못했어요:', err)
+
+
 def worker():
     while True:
         job = work.get()
@@ -79,6 +100,7 @@ def worker():
                 r.update(kind='clip')
             job['result'] = r
             job['state'] = 'done'
+            threading.Thread(target=to_drive, args=(job,), daemon=True).start()
             try:
                 os.remove(src)
             except OSError:
@@ -204,7 +226,7 @@ class Handler(BaseHTTPRequestHandler):
             size = os.path.getsize(r['path'])
             meta = {k: r.get(k) for k in ('kind', 'layout', 'width', 'height', 'duration', 'fixes', 'partial', 'frames')}
             if sub == '/info':
-                return self.send(200, {'size': size, 'meta': meta})
+                return self.send(200, {'size': size, 'meta': meta, 'drive': os.path.isdir(DRIVE) and f'{DRIVE_DIR}/{os.path.basename(r["path"])}'})
             rng = re.match(r'bytes=(\d+)-(\d*)', self.headers.get('Range', ''))
             a = int(rng.group(1)) if rng else 0
             b = min(size - 1, int(rng.group(2))) if rng and rng.group(2) else size - 1

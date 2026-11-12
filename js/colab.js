@@ -126,24 +126,43 @@ async function run(file, params, { onProgress, stop, signal }) {
     const live = { on: true, avail: 0, next: 0, ctls: new Set(), workers: [] };
     const received = () => have.size * CH;
     const wait = ms => new Promise(r => setTimeout(r, ms));
-    // Bytes [a, b) of the clip, counting them as they arrive.
+    // Each tunnel's record: one that fails or crawls is left out (quick tunnels vary a lot).
+    const stat = (parse()?.bases || [0]).map(() => ({ bytes: 0, ms: 0, fails: 0 }));
+    const rate = k => (stat[k].ms > 3000 ? stat[k].bytes / stat[k].ms : null);
+    const lane = i => {
+      let pool = stat.map((_, k) => k).filter(k => stat[k].fails < 2);
+      if (!pool.length) pool = stat.map((_, k) => k);
+      const best = Math.max(0, ...pool.map(k => rate(k) || 0));
+      const good = pool.filter(k => rate(k) === null || rate(k) >= best * 0.3);
+      return good[i % good.length];
+    };
+    // A piece of the clip through tunnel `via`, counting the bytes as they arrive.
     const getRange = async (path, via, signal, onBytes, headers) => {
-      const res = await call(path, { via, signal, headers });
-      const reader = res.body.getReader(), chunks = [];
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        chunks.push(value);
-        onBytes?.(value.byteLength);
+      const t = performance.now(), st = stat[via % stat.length];
+      try {
+        const res = await call(path, { via, signal, headers });
+        const reader = res.body.getReader(), chunks = [];
+        let n = 0;
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(value);
+          n += value.byteLength;
+          onBytes?.(value.byteLength);
+        }
+        if (n) { st.bytes += n; st.ms += performance.now() - t; }
+        return { blob: new Blob(chunks), res };
+      } catch (err) {
+        if (err.name !== 'AbortError') st.fails++;
+        throw err;
       }
-      return { blob: new Blob(chunks), res };
     };
     const liveWorker = async w => {
       while (live.on) {
         if (live.next + CH > live.avail) { // nothing whole to take yet: see how far it's written
           if (w === 0) {
             try {
-              const { res } = await getRange(`/jobs/${id}/live?from=0&to=0`, 0);
+              const { res } = await getRange(`/jobs/${id}/live?from=0&to=0`, lane(0));
               live.avail = Number(res.headers.get('X-Size')) || 0;
             } catch {}
           }
@@ -155,13 +174,13 @@ async function run(file, params, { onProgress, stop, signal }) {
         const ctl = new AbortController();
         live.ctls.add(ctl);
         try {
-          const { blob } = await getRange(`/jobs/${id}/live?from=${a}&to=${a + CH}`, w, ctl.signal);
+          const { blob } = await getRange(`/jobs/${id}/live?from=${a}&to=${a + CH}`, lane(w), ctl.signal);
           if (blob.size === CH) have.set(a, blob);
         } catch { /* left as a gap: fetched at the end */ }
         live.ctls.delete(ctl);
       }
     };
-    live.workers = Array.from({ length: Math.min(8, 2 * lanes) }, (_, w) => liveWorker(w));
+    live.workers = Array.from({ length: Math.min(4, 2 * lanes) }, (_, w) => liveWorker(w));
     stopLive = async () => { live.on = false; for (const c of live.ctls) c.abort(); await Promise.all(live.workers); };
     let stopSent = false, s;
     for (;;) {
@@ -189,7 +208,9 @@ async function run(file, params, { onProgress, stop, signal }) {
       call(`/jobs/${id}`, { method: 'DELETE' }).catch(() => {});
       return whole;
     }
-    const { size, meta } = info;
+    const { size, meta, drive } = info;
+    const tip = drive ? `
+느리면 구글 드라이브의 "${drive.split('/').slice(0, -1).join('/')}" 폴더에서 받아 파일 가져오기로 넣어도 돼요` : '';
     // What's still missing (all of it for clips that can't be fetched early), in pieces spread
     // over the tunnels, several at once.
     const missing = [];
@@ -204,15 +225,15 @@ async function run(file, params, { onProgress, stop, signal }) {
     const show = () => {
       const now = got.reduce((x, y) => x + y, 0), sum = already + now;
       const secs = (performance.now() - t1) / 1000, speed = secs > 1 ? ` · ${MB(now / secs)}MB/s` : '';
-      onProgress?.({ stage: `완성된 클립 받는 중 ${Math.round(sum / size * 100)}% (${MB(sum)} / ${MB(size)}MB${speed})` });
+      onProgress?.({ stage: `완성된 클립 받는 중 ${Math.round(sum / size * 100)}% (${MB(sum)} / ${MB(size)}MB${speed})${tip}` });
     };
     show();
-    await parallel(missing.length, Math.min(16, 4 * lanes), async i => {
+    await parallel(missing.length, Math.min(8, 2 * lanes), async i => {
       aborted();
       const [a, b] = missing[i];
       const { blob } = await retry(t => {
         got[i] = 0;
-        return getRange(`/jobs/${id}/result`, i + t, signal, n => { got[i] += n; show(); }, { Range: `bytes=${a}-${b - 1}` });
+        return getRange(`/jobs/${id}/result`, lane(i + t), signal, n => { got[i] += n; show(); }, { Range: `bytes=${a}-${b - 1}` });
       });
       have.set(a, blob);
     });
