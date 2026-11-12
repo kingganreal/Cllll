@@ -13,15 +13,20 @@ export function save(text) {
   try { text ? localStorage.setItem(LS, text.trim()) : localStorage.removeItem(LS); } catch {}
 }
 
-/** { base, key } from the address the notebook printed, or null. */
+/** { base, bases, key } from the address the notebook printed, or null. Newer notebooks open
+ * several tunnels (one is slow) and list the others after &more=; pieces are spread over them. */
 export function parse(text = saved()) {
-  const m = (text || '').trim().match(/^(https?:\/\/[^/#?\s]+)[^#]*#key=([\w-]+)$/);
-  return m ? { base: m[1], key: m[2] } : null;
+  const m = (text || '').trim().match(/^(https?:\/\/[^/#?\s]+)[^#]*#key=([\w-]+)(?:&more=([\w.,-]+))?$/);
+  if (!m) return null;
+  const bases = [m[1], ...(m[3] ? m[3].split(',').filter(Boolean).map(h => 'https://' + h) : [])];
+  return { base: m[1], bases, key: m[2] };
 }
 
+// opts.via picks the tunnel (any number; it wraps around).
 async function call(path, opts = {}, server = parse()) {
   if (!server) throw new Error('코랩 주소가 없어요.');
-  const res = await fetch(server.base + path, { ...opts, headers: { 'X-Key': server.key, ...(opts.headers || {}) } });
+  const { via = 0, ...rest } = opts;
+  const res = await fetch(server.bases[via % server.bases.length] + path, { ...rest, headers: { 'X-Key': server.key, ...(rest.headers || {}) } });
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
     throw new Error(body.error || `코랩 서버 오류 (${res.status})`);
@@ -87,7 +92,7 @@ async function parallel(count, width, task) {
 // A piece that fails over a flaky tunnel is tried again a couple of times.
 async function retry(fn, tries = 3) {
   for (let t = 1; ; t++) {
-    try { return await fn(); } catch (err) {
+    try { return await fn(t - 1); } catch (err) {
       if (t >= tries || err.name === 'AbortError') throw err;
       await new Promise(r => setTimeout(r, 1000 * t));
     }
@@ -105,36 +110,59 @@ async function run(file, params, { onProgress, stop, signal }) {
     // A quick tunnel is slow per connection, so the pieces go several at a time.
     const parts = params.url ? 0 : Math.max(1, Math.ceil(file.size / PART));
     let sent = 0;
-    await parallel(parts, 3, async i => {
+    const lanes = parse()?.bases.length || 1;
+    await parallel(parts, Math.min(8, 3 * lanes), async i => {
       aborted();
-      await retry(() => call(`/jobs/${id}/part?i=${i}`, { method: 'PUT', body: file.slice(i * PART, (i + 1) * PART) }));
+      await retry(t => call(`/jobs/${id}/part?i=${i}`, { method: 'PUT', body: file.slice(i * PART, (i + 1) * PART), via: i + t }));
       onProgress?.({ stage: `코랩으로 영상 보내는 중 ${Math.round(++sent / parts * 100)}%` });
     });
     await call(`/jobs/${id}/start`, { method: 'POST' });
     const t0 = performance.now();
     // Circle clips can be fetched while they're being made (the server's /live: a file that only
-    // grows), so little is left to fetch at the end. Other clips answer 204 until they're done.
-    const live = { chunks: [], got: 0, on: true, ctl: null };
-    const liveLoop = (async () => {
-      const wait = ms => new Promise(r => setTimeout(r, ms));
-      while (live.on) {
-        let n = 0;
-        try {
-          live.ctl = new AbortController();
-          const res = await call(`/jobs/${id}/live?from=${live.got}`, { signal: live.ctl.signal });
-          if (res.status === 200) {
-            const reader = res.body.getReader();
-            for (;;) {
-              const { done, value } = await reader.read();
-              if (done) break;
-              live.chunks.push(value); live.got += value.byteLength; n += value.byteLength;
-            }
-          }
-        } catch { /* a cut-off read still leaves a good prefix */ }
-        if (live.on && !n) await wait(2500);
+    // grows), so little is left to fetch at the end. Whole 4 MB pieces are taken as soon as they
+    // are written, a few at once over all the tunnels; whatever is missing is fetched at the end.
+    const CH = 4 << 20;
+    const have = new Map(); // offset -> Blob of CH bytes
+    const live = { on: true, avail: 0, next: 0, ctls: new Set(), workers: [] };
+    const received = () => have.size * CH;
+    const wait = ms => new Promise(r => setTimeout(r, ms));
+    // Bytes [a, b) of the clip, counting them as they arrive.
+    const getRange = async (path, via, signal, onBytes, headers) => {
+      const res = await call(path, { via, signal, headers });
+      const reader = res.body.getReader(), chunks = [];
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        onBytes?.(value.byteLength);
       }
-    })();
-    stopLive = async () => { live.on = false; live.ctl?.abort(); await liveLoop; };
+      return { blob: new Blob(chunks), res };
+    };
+    const liveWorker = async w => {
+      while (live.on) {
+        if (live.next + CH > live.avail) { // nothing whole to take yet: see how far it's written
+          if (w === 0) {
+            try {
+              const { res } = await getRange(`/jobs/${id}/live?from=0&to=0`, 0);
+              live.avail = Number(res.headers.get('X-Size')) || 0;
+            } catch {}
+          }
+          if (live.next + CH > live.avail) await wait(2000);
+          continue;
+        }
+        const a = live.next;
+        live.next += CH;
+        const ctl = new AbortController();
+        live.ctls.add(ctl);
+        try {
+          const { blob } = await getRange(`/jobs/${id}/live?from=${a}&to=${a + CH}`, w, ctl.signal);
+          if (blob.size === CH) have.set(a, blob);
+        } catch { /* left as a gap: fetched at the end */ }
+        live.ctls.delete(ctl);
+      }
+    };
+    live.workers = Array.from({ length: Math.min(8, 2 * lanes) }, (_, w) => liveWorker(w));
+    stopLive = async () => { live.on = false; for (const c of live.ctls) c.abort(); await Promise.all(live.workers); };
     let stopSent = false, s;
     for (;;) {
       aborted();
@@ -149,7 +177,7 @@ async function run(file, params, { onProgress, stop, signal }) {
       else if (s.stage || !s.total) onProgress?.({ stage: s.stage || '코랩에서 준비 중' });
       else {
         const elapsed = (performance.now() - t0) / 1000;
-        onProgress?.({ done: s.done, total: s.total, elapsed, eta: s.done ? elapsed / s.done * (s.total - s.done) : 0, fixes: s.fixes, received: live.got });
+        onProgress?.({ done: s.done, total: s.total, elapsed, eta: s.done ? elapsed / s.done * (s.total - s.done) : 0, fixes: s.fixes, received: received() });
       }
     }
     await stopLive();
@@ -162,34 +190,33 @@ async function run(file, params, { onProgress, stop, signal }) {
       return whole;
     }
     const { size, meta } = info;
-    if (live.got > size) { live.chunks = []; live.got = 0; } // not the same file after all
-    const from = live.got; // what came while it was being made
-    const RANGE = 8 * 1024 * 1024, n = Math.ceil((size - from) / RANGE), pieces = new Array(n);
+    // What's still missing (all of it for clips that can't be fetched early), in pieces spread
+    // over the tunnels, several at once.
+    const missing = [];
+    for (let a = 0; a < size; a += CH) {
+      const b = Math.min(size, a + CH);
+      if (!(b - a === CH && have.has(a))) missing.push([a, b]);
+    }
+    const already = size - missing.reduce((x, [a, b]) => x + b - a, 0);
+    const got = new Array(missing.length).fill(0);
     const MB = v => (v / 1048576).toFixed(1);
-    const got = new Array(n).fill(0); // bytes so far of each piece (counted as they arrive)
+    const t1 = performance.now();
     const show = () => {
-      const sum = from + got.reduce((x, y) => x + y, 0);
-      onProgress?.({ stage: `완성된 클립 받는 중 ${Math.round(sum / size * 100)}% (${MB(sum)} / ${MB(size)}MB)` });
+      const now = got.reduce((x, y) => x + y, 0), sum = already + now;
+      const secs = (performance.now() - t1) / 1000, speed = secs > 1 ? ` · ${MB(now / secs)}MB/s` : '';
+      onProgress?.({ stage: `완성된 클립 받는 중 ${Math.round(sum / size * 100)}% (${MB(sum)} / ${MB(size)}MB${speed})` });
     };
     show();
-    await parallel(n, 6, async i => {
+    await parallel(missing.length, Math.min(16, 4 * lanes), async i => {
       aborted();
-      const a = from + i * RANGE, b = Math.min(size, a + RANGE) - 1;
-      pieces[i] = await retry(async () => {
+      const [a, b] = missing[i];
+      const { blob } = await retry(t => {
         got[i] = 0;
-        const res = await call(`/jobs/${id}/result`, { headers: { Range: `bytes=${a}-${b}` } });
-        const reader = res.body.getReader(), chunks = [];
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          chunks.push(value);
-          got[i] += value.byteLength;
-          show();
-        }
-        return new Blob(chunks);
+        return getRange(`/jobs/${id}/result`, i + t, signal, n => { got[i] += n; show(); }, { Range: `bytes=${a}-${b - 1}` });
       });
+      have.set(a, blob);
     });
-    const blob = new Blob([...live.chunks, ...pieces], { type: 'video/mp4' });
+    const blob = new Blob([...have.keys()].sort((x, y) => x - y).map(k => have.get(k)), { type: 'video/mp4' });
     call(`/jobs/${id}`, { method: 'DELETE' }).catch(() => {}); // free the server's disk
     return { blob, meta };
   } finally {

@@ -29,21 +29,33 @@ BF16 = DEVICE == 'cuda' and torch.cuda.is_bf16_supported(including_emulation=Fal
 CACHE = os.path.expanduser('~/.cache/fancam')
 
 SAM_MODELS = {  # name -> (config, checkpoint URL)
-    'tiny': ('configs/sam2.1/sam2.1_hiera_t.yaml', 'https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt'),
-    'small': ('configs/sam2.1/sam2.1_hiera_s.yaml', 'https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_small.pt'),
-    'base_plus': ('configs/sam2.1/sam2.1_hiera_b+.yaml', 'https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_base_plus.pt'),
-    'large': ('configs/sam2.1/sam2.1_hiera_l.yaml', 'https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt'),
+    'tiny': ('configs/sam2.1/sam2.1_hiera_t.yaml', 'sam2.1-hiera-tiny/resolve/main/sam2.1_hiera_tiny.pt'),
+    'small': ('configs/sam2.1/sam2.1_hiera_s.yaml', 'sam2.1-hiera-small/resolve/main/sam2.1_hiera_small.pt'),
+    'base_plus': ('configs/sam2.1/sam2.1_hiera_b+.yaml', 'sam2.1-hiera-base-plus/resolve/main/sam2.1_hiera_base_plus.pt'),
+    'large': ('configs/sam2.1/sam2.1_hiera_l.yaml', 'sam2.1-hiera-large/resolve/main/sam2.1_hiera_large.pt'),
 }
+# Hugging Face first; Meta's own server as a fallback (its certificate lapsed on 2026-11-11, which
+# broke every download from it).
+SAM_HF = 'https://huggingface.co/facebook/'
+SAM_META = 'https://dl.fbaipublicfiles.com/segment_anything_2/092824/'
 FACE_ZIP = 'https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_s.zip'
 
 
-def fetch(url, name=None):
+def fetch(url, name=None, fallbacks=()):
+    """Downloads once into CACHE; tries the fallbacks in turn if a server fails."""
     os.makedirs(CACHE, exist_ok=True)
     path = os.path.join(CACHE, name or url.rsplit('/', 1)[-1])
     if not os.path.exists(path):
-        print('받는 중:', url)
         tmp = path + '.part'
-        urllib.request.urlretrieve(url, tmp)
+        for k, u in enumerate([url, *fallbacks]):
+            print('받는 중:', u)
+            try:
+                urllib.request.urlretrieve(u, tmp)
+                break
+            except Exception as err:
+                if k == len(fallbacks):
+                    raise
+                print('  실패, 다른 곳에서 받아요:', err)
         os.replace(tmp, path)
     return path
 
@@ -506,7 +518,8 @@ def make_clip(video, out_dir, name='설윤', photos=(), start=0.0, end=None, fps
             # as fast and follows her just as well.
             sam_model = 'base_plus' if BF16 else 'small'
         cfg, url = SAM_MODELS[sam_model]
-        predictor = build_sam2_video_predictor(cfg, fetch(url), device=DEVICE)
+        file = url.rsplit('/', 1)[-1]
+        predictor = build_sam2_video_predictor(cfg, fetch(SAM_HF + url, file, [SAM_META + file]), device=DEVICE)
 
     # Output: colour and alpha packed like the app does (side by side for portrait, else stacked).
     # The circle keeps the source's full size (4K stays 4K): just the picture, with a 16 px strip

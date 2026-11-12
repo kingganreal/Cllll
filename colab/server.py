@@ -10,7 +10,7 @@ goes into the app together with a random key (every request must carry it). One 
   GET  /jobs/<id>                      {state, done, total, stage, error}
   POST /jobs/<id>/stop                 finish early, keeping what's made (여기까지 저장)
   DELETE /jobs/<id>                    cancel and forget
-  GET  /jobs/<id>/live?from=N          the clip so far while it is made (circle mode), X-Final/X-Size
+  GET  /jobs/<id>/live?from=A&to=B     the clip so far while it is made (circle mode), X-Final/X-Size
   GET  /jobs/<id>/info                 the finished clip's size and details
   GET  /jobs/<id>/result               the clip (packed MP4), whole or a Range of it (the app fetches
                                        several ranges at once: a quick tunnel is slow per connection)
@@ -167,15 +167,18 @@ class Handler(BaseHTTPRequestHandler):
             threading.Timer(30, lambda: (jobs.pop(job['id'], None), shutil.rmtree(job['dir'], ignore_errors=True))).start()
             return self.send(200, {'ok': True})
         if sub == '/live' and method == 'GET':
-            # The clip while it's being made (it only grows): bytes from ?from= to what's written so far.
-            # X-Final: 1 once it's complete (then the bytes up to X-Size are the whole clip).
+            # The clip while it's being made (it only grows): bytes ?from= up to ?to= (or 16 MB), as
+            # far as written. X-Size: written so far (0: nothing yet); X-Final: 1 once it's complete.
             r = job['result']
             path = r['path'] if r else job.get('live')
             if not path or not os.path.exists(path):
-                return self.send(204 if job['state'] in ('queued', 'running', 'downloading') else 409, {})
-            a = int((re.search(r'from=(\d+)', self.path) or [0, 0])[1])
-            size = os.path.getsize(path)
-            limit = min(size, a + (16 << 20))
+                if job['state'] not in ('queued', 'running', 'downloading', 'uploading'):
+                    return self.send(409, {'error': '클립이 없어요.'})
+                path = None
+            q = lambda k, d: int((re.search(k + r'=(\d+)', self.path) or [0, d])[1])
+            size = os.path.getsize(path) if path else 0
+            a = q('from', 0)
+            limit = max(a, min(size, q('to', a + (16 << 20))))
             self.send_response(200)
             self.cors()
             self.send_header('Content-Type', 'application/octet-stream')
@@ -183,15 +186,16 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header('X-Final', '1' if r else '0')
             self.send_header('X-Size', str(size))
             self.end_headers()
-            with open(path, 'rb') as f:
-                f.seek(a)
-                left = limit - a
-                while left > 0:
-                    chunk = f.read(min(left, 1 << 20))
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
-                    left -= len(chunk)
+            if limit > a:
+                with open(path, 'rb') as f:
+                    f.seek(a)
+                    left = limit - a
+                    while left > 0:
+                        chunk = f.read(min(left, 1 << 20))
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        left -= len(chunk)
             return
         if sub in ('/result', '/info') and method == 'GET':
             r = job['result']
@@ -246,13 +250,32 @@ def tunnel(port):
     raise RuntimeError('공개 주소를 만들지 못했어요.')
 
 
-def serve(port=8765, public=True):
+def serve(port=8765, public=True, tunnels=4):
     os.makedirs(ROOT, exist_ok=True)
     threading.Thread(target=worker, daemon=True).start()
     httpd = ThreadingHTTPServer(('0.0.0.0', port), Handler)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    base = tunnel(port) if public else f'http://localhost:{port}'
-    link = f'{base}/#key={KEY}'
+    if public:
+        # One quick tunnel is slow, so several are opened side by side and the app spreads its
+        # pieces over them (the extra ones ride along in the address as &more=).
+        found = [None] * tunnels
+
+        def one(k):
+            try:
+                found[k] = tunnel(port)
+            except Exception as err:
+                print('터널 하나를 못 열었어요:', err)
+        ts = [threading.Thread(target=one, args=(k,)) for k in range(tunnels)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(90)
+        bases = [b for b in found if b]
+        if not bases:
+            raise RuntimeError('공개 주소를 만들지 못했어요.')
+    else:
+        bases = [f'http://localhost:{port}']
+    link = f'{bases[0]}/#key={KEY}' + ('&more=' + ','.join(b.split('//')[1] for b in bases[1:]) if len(bases) > 1 else '')
     print('\n앱의 만들기 → "코랩 GPU로 처리"에 이 주소를 붙여 넣으세요:\n\n   ' + link + '\n')
     print('이 칸이 실행 중인 동안 앱에서 쓸 수 있어요. 코랩을 다시 켜면 주소가 바뀌어요.')
     return link
