@@ -6,11 +6,13 @@
 //   POST /clips/<id>/show           put it on the desktop
 //   GET /clips                      every clip kept here (details)
 //   GET /clips/<id>/video, /thumb   a clip's files, to restore it into the web app
+//   /drive/…                        Colab through Google Drive (see drivejobs.js)
 const http = require('http');
 const fs = require('fs');
 const { pipeline } = require('stream/promises');
 const store = require('./store');
 const ytdlp = require('./ytdlp');
+const drivejobs = require('./drivejobs');
 const { ALLOWED_ORIGINS, PORT } = require('./config');
 
 const API_VERSION = 2;
@@ -107,6 +109,7 @@ function start({ appVersion, onClipsChanged, onShow }) {
         res.writeHead(200, { 'Content-Type': m[2] === 'video' ? 'video/mp4' : 'image/png', 'Content-Length': fs.statSync(file).size });
         return pipeline(fs.createReadStream(file), res).catch(() => {});
       }
+      if (await drivejobs.route(req, res, p, send, readJson)) return;
       return send(404, { error: 'not found' });
     } catch (err) {
       console.error(err);

@@ -5,6 +5,7 @@ import * as drive from './drive.js';
 import { GOOGLE_CLIENT_ID } from './config.js';
 import * as pcHelper from './helper.js';
 import * as colab from './colab.js';
+import * as drivejob from './drivejob.js';
 
 const $ = sel => document.querySelector(sel);
 const fmtTime = s => {
@@ -710,6 +711,14 @@ const faces = {
 const colabBox = {
   async check() {
     const text = $('#colab-url').value.trim(), state = $('#colab-state');
+    if (drivejob.enabled()) {
+      state.textContent = '· 확인 중…'; state.className = 'colab-state';
+      const r = await drivejob.ready();
+      if (!drivejob.enabled()) return this.check();
+      state.textContent = r.ok ? `· 드라이브로 연결됨${r.gpu ? ` (${r.gpu})` : ''}` : '· ' + r.why;
+      state.className = 'colab-state ' + (r.ok ? 'ok' : 'warn');
+      return;
+    }
     if (!text) { state.textContent = ''; return; }
     if (!colab.parse(text)) { state.textContent = '· 주소 형식이 달라요'; state.className = 'colab-state warn'; return; }
     state.textContent = '· 확인 중…'; state.className = 'colab-state';
@@ -720,7 +729,8 @@ const colabBox = {
   },
   show() {
     $('#colab-url').value = colab.saved();
-    $('#colab-box').open = !!colab.saved();
+    $('#colab-drive').checked = drivejob.enabled();
+    $('#colab-box').open = !!colab.saved() || drivejob.enabled();
     this.check();
   },
 };
@@ -730,6 +740,7 @@ $('#shape').addEventListener('change', () => {
 });
 $('#tracker').addEventListener('change', () => { try { localStorage.setItem('fancam-tracker', $('#tracker').value); } catch {} });
 $('#colab-url').addEventListener('change', () => { colab.save($('#colab-url').value); colabBox.check(); });
+$('#colab-drive').addEventListener('change', () => { drivejob.setEnabled($('#colab-drive').checked); colabBox.check(); });
 
 $('#faces-input').addEventListener('change', e => {
   const files = [...e.target.files];
@@ -948,7 +959,7 @@ const create = {
     const full = ([x, y]) => [(r.x + x * r.w) / v.videoWidth, (r.y + y * r.h) / v.videoHeight];
     const tap = opts.tap || (t?.bbox ? [(t.bbox[0] + t.bbox[2]) / 2, t.bbox[1] + (t.bbox[3] - t.bbox[1]) * 0.3] : [t.cx, t.cy]);
     const box = t?.bbox ? [...full([t.bbox[0], t.bbox[1]]), ...full([t.bbox[2], t.bbox[3]])] : null;
-    const { blob, meta } = await colab.extract(opts.file, {
+    const { blob, meta } = await (drivejob.enabled() ? drivejob : colab).extract(opts.file, {
       name, start: opts.start, end: opts.end, fps: opts.fps, maxSide: opts.maxSide, shape: opts.shape,
       tracker: opts.tracker, url: this.sourceUrl || null,
       faceRef: opts.faceRef ? Array.from(opts.faceRef) : null, pick: { tap: full(tap), box },
@@ -1079,7 +1090,12 @@ const create = {
       }
     };
     try {
-      const remote = colab.parse() && await colab.status();
+      let remote;
+      if (drivejob.enabled()) {
+        const r = await drivejob.ready();
+        if (!r.ok) throw new Error(r.why + ' ("구글 드라이브로 주고받기"를 끄면 코랩 주소나 이 기기로 처리해요.)');
+        remote = true;
+      } else remote = colab.parse() && await colab.status();
       if (opts.shape === '3d' && !remote) throw new Error('3D는 코랩 GPU에서 만들어요. 위의 "코랩 GPU로 처리"에 코랩 주소를 넣고 코랩을 켜 주세요.');
       const result = remote ? await this.extractOnColab(opts, name) : await p.extract(opts);
       if (runId !== this.runId) return; // cancelled meanwhile

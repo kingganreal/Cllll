@@ -36,7 +36,7 @@ jobs = {}
 work = queue.Queue()
 
 
-DRIVE = '/content/drive/MyDrive'
+DRIVE = os.environ.get('FANCAM_DRIVE', '/content/drive/MyDrive')  # (FANCAM_DRIVE: for trying it out off Colab)
 DRIVE_DIR = '직캠 스테이지/코랩'
 
 
@@ -55,6 +55,16 @@ def to_drive(job):
         print('드라이브에도 저장했어요:', dst)
     except Exception as err:
         print('드라이브에 저장하지 못했어요:', err)
+
+
+_worker_started = False
+
+
+def start_worker():
+    global _worker_started
+    if not _worker_started:
+        _worker_started = True
+        threading.Thread(target=worker, daemon=True).start()
 
 
 def worker():
@@ -99,8 +109,9 @@ def worker():
                     on_output=lambda path: job.update(live=path), **common)
                 r.update(kind='clip')
             job['result'] = r
+            if not job.get('via_drive'):  # (a Drive job's clip goes to its own job folder)
+                threading.Thread(target=to_drive, args=(job,), daemon=True).start()
             job['state'] = 'done'
-            threading.Thread(target=to_drive, args=(job,), daemon=True).start()
             try:
                 os.remove(src)
             except OSError:
@@ -291,7 +302,7 @@ def serve(port=8765, public=True, tunnels=4):
             pass
     if public and shutil.which('pkill'):
         subprocess.run(['pkill', '-f', 'cloudflared tunnel'], check=False)
-    threading.Thread(target=worker, daemon=True).start()
+    start_worker()
     for k in range(20):  # still taken (another notebook?): the next port
         try:
             httpd = ThreadingHTTPServer(('0.0.0.0', port + k), Handler)
@@ -355,6 +366,156 @@ def wait():
         old = getattr(__import__('builtins'), '_fancam_httpd', None)
         if old is not None:
             old.shutdown(); old.server_close()
+
+
+
+# ---------------------------------------------------------------------------
+# Through Google Drive only, no tunnel (notebook 5-C): the Windows app writes a job into
+# 내 드라이브/직캠 스테이지/코랩/jobs/<id>/ (job.json, and source.mp4 unless it's a YouTube link)
+# through Google Drive on the PC; this picks it up, writes status.json as it goes and the
+# finished clip next to it, which Google Drive brings back down to the PC. `stop` / `cancel`
+# files in the folder end it early. alive.json tells the app this notebook is on.
+
+DRIVE_JOBS = os.path.join(DRIVE, DRIVE_DIR, 'jobs')
+FINAL = ('done', 'error', 'cancelled')
+
+
+def _write_json(path, obj):
+    tmp = f'{path}.{os.getpid()}.tmp'
+    with open(tmp, 'w', encoding='utf8') as f:
+        json.dump(obj, f, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def _read_json(path):
+    try:
+        with open(path, encoding='utf8') as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _take_drive_job(jid, d, spec):
+    """A Drive job into the local queue (its source copied out of Drive first)."""
+    local = os.path.join(ROOT, jid)
+    os.makedirs(local, exist_ok=True)
+    params = {k: v for k, v in spec.items() if k not in ('sourceSize', 'created')}
+    job = {'id': jid, 'dir': local, 'params': params, 'state': 'queued', 'parts': 0, 'stop': False,
+           'done': 0, 'total': 0, 'stage': None, 'error': None, 'result': None, 'created': time.time(),
+           'via_drive': d}
+    if not params.get('url'):
+        shutil.copyfile(os.path.join(d, 'source.mp4'), os.path.join(local, 'part0'))
+        job['parts'] = 1
+    jobs[jid] = job
+    work.put(job)
+    return job
+
+
+def _drive_status(job):
+    st = {k: job.get(k) for k in ('state', 'done', 'total', 'stage', 'error')}
+    r = job.get('result')
+    if job['state'] == 'done':
+        if not job.get('exported'):
+            st['state'], st['stage'] = 'running', '드라이브에 클립 올리는 중'
+        else:
+            st['file'] = os.path.basename(r['path'])
+            st['meta'] = {k: r.get(k) for k in ('kind', 'layout', 'width', 'height', 'duration', 'fixes', 'partial', 'frames')}
+            st['size'] = os.path.getsize(r['path'])
+    st['fixes'] = r and r.get('fixes')
+    st['time'] = time.time()
+    return st
+
+
+def _export(job):
+    """The finished clip into its Drive job folder."""
+    src = job['result']['path']
+    dst = os.path.join(job['via_drive'], os.path.basename(src))
+    shutil.copyfile(src, dst + '.part')
+    os.replace(dst + '.part', dst)
+    job['exported'] = True
+
+
+def watch_drive(poll=4):
+    """Runs Drive jobs until the cell is stopped (it keeps the cell running, so Colab doesn't cut
+    the runtime off)."""
+    if not os.path.isdir(DRIVE):
+        raise RuntimeError('구글 드라이브가 연결되지 않았어요. 2번 칸을 먼저 실행하세요.')
+    os.makedirs(DRIVE_JOBS, exist_ok=True)
+    os.makedirs(ROOT, exist_ok=True)
+    start_worker()
+    import torch
+    gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
+    mine, written, last_alive = {}, {}, 0
+    stamp = lambda *a: print(time.strftime('%H:%M:%S'), *a, flush=True)
+    stamp('드라이브로 주고받을 준비가 됐어요. 앱에서 추출 시작을 누르세요. (끝내려면 이 칸을 멈추세요)')
+    try:
+        while True:
+            now = time.time()
+            if now - last_alive > 20:
+                _write_json(os.path.join(DRIVE, DRIVE_DIR, 'alive.json'), {'time': now, 'gpu': gpu})
+                last_alive = now
+            try:
+                names = os.listdir(DRIVE_JOBS)
+            except OSError:
+                names = []
+            for jid in names:
+                d = os.path.join(DRIVE_JOBS, jid)
+                if jid in mine:
+                    job = mine[jid]
+                    if job is not None:
+                        if os.path.exists(os.path.join(d, 'stop')):
+                            job['stop'] = True
+                        if os.path.exists(os.path.join(d, 'cancel')) and job['state'] not in FINAL:
+                            job['state'] = 'cancelled'
+                    continue
+                spec = _read_json(os.path.join(d, 'job.json'))
+                if spec is None or os.path.exists(os.path.join(d, 'cancel')):
+                    continue
+                old = _read_json(os.path.join(d, 'status.json'))
+                if old and old.get('state') in FINAL:
+                    mine[jid] = None  # finished before (an earlier runtime)
+                    continue
+                if not spec.get('url'):
+                    src = os.path.join(d, 'source.mp4')
+                    if not os.path.exists(src) or os.path.getsize(src) != spec.get('sourceSize'):
+                        continue  # still coming up from the PC
+                try:
+                    mine[jid] = _take_drive_job(jid, d, spec)
+                    stamp('새 작업:', spec.get('name') or jid)
+                except Exception as err:
+                    _write_json(os.path.join(d, 'status.json'), {'state': 'error', 'error': f'영상을 꺼내지 못했어요: {err}', 'time': now})
+                    mine[jid] = None
+            for jid, job in list(mine.items()):
+                if job is None:
+                    continue
+                d = job['via_drive']
+                if job['state'] == 'done' and not job.get('exported'):
+                    _write_json(os.path.join(d, 'status.json'), _drive_status(job))
+                    try:
+                        _export(job)
+                        stamp('완성, 드라이브에 올렸어요:', os.path.basename(job['result']['path']))
+                    except Exception as err:
+                        job['state'], job['error'] = 'error', f'드라이브에 올리지 못했어요: {err}'
+                st = _drive_status(job)
+                key = (st['state'], st['done'] // 30 if st['done'] else 0, st['stage'], st['error'], st.get('file'))
+                if written.get(jid) != key or now - written.get(jid + ':t', 0) > 30:
+                    try:
+                        if os.path.isdir(d):
+                            _write_json(os.path.join(d, 'status.json'), st)
+                    except OSError:
+                        pass
+                    written[jid], written[jid + ':t'] = key, now
+                if st['state'] in FINAL:
+                    if st['state'] != 'done':
+                        stamp('끝:', st['state'], st.get('error') or '')
+                    mine[jid] = None
+                    shutil.rmtree(job['dir'], ignore_errors=True)
+                elif st['total'] and written.get(jid + ':p') != st['done'] * 10 // st['total']:
+                    written[jid + ':p'] = st['done'] * 10 // st['total']
+                    stamp(f"{job['params'].get('name') or '클립'}: {st['done']}/{st['total']} 프레임")
+            time.sleep(poll)
+    except KeyboardInterrupt:
+        print('드라이브 작업 받기를 멈췄어요.')
 
 
 if __name__ == '__main__':
