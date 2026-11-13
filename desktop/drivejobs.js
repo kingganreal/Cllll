@@ -15,7 +15,9 @@ const { pipeline } = require('stream/promises');
 
 const SUB = path.join('직캠 스테이지', '코랩');
 
-/** The "My Drive" folder of Google Drive for desktop on this PC, or null. */
+/** The "My Drive" folder of Google Drive for desktop on this PC, or null. With several Google
+ * accounts connected (G:, H:, …) it's the one Colab uses: where the notebook last said it was on
+ * (alive.json), else one that already has the folder, else the first. */
 function driveRoot() {
   const names = ['My Drive', '내 드라이브'];
   const tries = [];
@@ -24,7 +26,12 @@ function driveRoot() {
   const home = os.homedir();
   for (const n of names) tries.push(path.join(home, n), path.join(home, 'Google Drive', n));
   tries.push(path.join(home, 'Google Drive'));
-  return tries.find(p => { try { return fs.statSync(p).isDirectory(); } catch { return false; } }) || null;
+  const roots = tries.filter(p => { try { return fs.statSync(p).isDirectory(); } catch { return false; } });
+  if (!roots.length) return null;
+  const alive = r => readJson(path.join(r, SUB, 'alive.json'))?.time || 0;
+  const newest = roots.reduce((a, b) => (alive(b) > alive(a) ? b : a));
+  if (alive(newest)) return newest;
+  return roots.find(r => fs.existsSync(path.join(r, SUB))) || roots[0];
 }
 
 const jobsDir = () => { const r = driveRoot(); return r && path.join(r, SUB, 'jobs'); };
