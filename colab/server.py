@@ -274,8 +274,28 @@ def tunnel(port):
 
 def serve(port=8765, public=True, tunnels=4):
     os.makedirs(ROOT, exist_ok=True)
+    # Running this cell again: stop the server and tunnels from the last run first (kept on
+    # builtins, so they're found even after the module was re-imported).
+    import builtins
+    old = getattr(builtins, '_fancam_httpd', None)
+    if old is not None:
+        try:
+            old.shutdown(); old.server_close()
+        except Exception:
+            pass
+    if public and shutil.which('pkill'):
+        subprocess.run(['pkill', '-f', 'cloudflared tunnel'], check=False)
     threading.Thread(target=worker, daemon=True).start()
-    httpd = ThreadingHTTPServer(('0.0.0.0', port), Handler)
+    for k in range(20):  # still taken (another notebook?): the next port
+        try:
+            httpd = ThreadingHTTPServer(('0.0.0.0', port + k), Handler)
+            port += k
+            break
+        except OSError as err:
+            if err.errno != 98 or k == 19:
+                raise
+            time.sleep(0.5 if k == 0 else 0)
+    builtins._fancam_httpd = httpd
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     if public:
         # One quick tunnel is slow, so several are opened side by side and the app spreads its
