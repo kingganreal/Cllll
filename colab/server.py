@@ -330,6 +330,33 @@ def serve(port=8765, public=True, tunnels=4):
     return link
 
 
+
+def wait():
+    """Keeps the notebook cell running (Colab cuts off a runtime whose cells have all finished,
+    even while this server is working) and shows what it's doing. Stop the cell to end it."""
+    last = None
+    try:
+        while True:
+            busy = [j for j in jobs.values() if j['state'] in ('uploading', 'queued', 'downloading', 'running')]
+            if busy:
+                j = busy[0]
+                done, total = j.get('done') or 0, j.get('total') or 0
+                line = f"{j['params'].get('name') or '클립'}: " + (
+                    {'uploading': '영상 받는 중', 'queued': '차례 기다리는 중', 'downloading': '유튜브에서 받는 중'}.get(j['state'])
+                    or j.get('stage') or (f'{done}/{total} 프레임 ({done * 100 // max(1, total)}%)' if total else '준비 중'))
+            else:
+                line = '기다리는 중 (앱에서 추출 시작을 누르세요)'
+            if line != last:
+                print(time.strftime('%H:%M:%S'), line, flush=True)
+                last = line
+            time.sleep(20)
+    except KeyboardInterrupt:
+        print('서버를 멈췄어요. 다시 쓰려면 이 칸을 다시 실행하세요.')
+        old = getattr(__import__('builtins'), '_fancam_httpd', None)
+        if old is not None:
+            old.shutdown(); old.server_close()
+
+
 if __name__ == '__main__':
     import sys
     serve(int(sys.argv[1]) if len(sys.argv) > 1 else 8765, public='--local' not in sys.argv)
