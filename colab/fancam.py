@@ -46,7 +46,7 @@ def fetch(url, name=None, fallbacks=()):
     os.makedirs(CACHE, exist_ok=True)
     path = os.path.join(CACHE, name or url.rsplit('/', 1)[-1])
     if not os.path.exists(path):
-        tmp = path + '.part'
+        tmp = f'{path}.{os.getpid()}.{threading.get_ident()}.part'  # two at once don't clash
         for k, u in enumerate([url, *fallbacks]):
             print('받는 중:', u)
             try:

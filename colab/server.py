@@ -256,12 +256,18 @@ class Handler(BaseHTTPRequestHandler):
     def do_DELETE(self): self.route('DELETE')
 
 
-def tunnel(port):
-    """A public https address for the port through a Cloudflare quick tunnel."""
+def cloudflared():
+    """The cloudflared program (downloaded once, before any tunnel starts)."""
     exe = shutil.which('cloudflared') or os.path.join(fancam.CACHE, 'cloudflared')
     if not os.path.exists(exe):
         fancam.fetch('https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64', 'cloudflared')
         os.chmod(exe, 0o755)
+    return exe
+
+
+def tunnel(port):
+    """A public https address for the port through a Cloudflare quick tunnel."""
+    exe = cloudflared()
     proc = subprocess.Popen([exe, 'tunnel', '--no-autoupdate', '--url', f'http://localhost:{port}'],
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     for line in proc.stdout:
@@ -300,6 +306,7 @@ def serve(port=8765, public=True, tunnels=4):
     if public:
         # One quick tunnel is slow, so several are opened side by side and the app spreads its
         # pieces over them (the extra ones ride along in the address as &more=).
+        cloudflared()
         found = [None] * tunnels
 
         def one(k):
