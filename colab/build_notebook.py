@@ -109,9 +109,10 @@ print('3D 준비 완료')
 앱으로 받는 게 느리면 거기서 받아 **파일 가져오기**로 넣으면 훨씬 빨라요. (PC에 구글 드라이브 앱이 켜져 있으면 저절로 내려와요.)
 """),
     py("""
-import sys
+import importlib, sys
 sys.path.insert(0, '/content')
-import server
+import fancam, server
+importlib.reload(fancam); importlib.reload(server)  # 4번에서 새로 쓴 코드로
 server.serve()
 server.wait()  # 이 칸은 계속 실행 중으로 둬요 (끝나면 코랩이 런타임을 끊어요)
 """),
@@ -125,9 +126,10 @@ PC에서는 **구글 드라이브 앱**(로그인된 상태)과 **직캠 스테�
 이 칸은 계속 실행 중(⏹)으로 둬요.
 """),
     py("""
-import sys
+import importlib, sys
 sys.path.insert(0, '/content')
-import server
+import fancam, server
+importlib.reload(fancam); importlib.reload(server)  # 4번에서 새로 쓴 코드로
 server.watch_drive()
 """),
     md('## 5-B. 앱 없이 여기서 바로 실행\n\n3번 설정대로 처리해요. 처리하는 동안 이 탭을 열어 두세요.'),
