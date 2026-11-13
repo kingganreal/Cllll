@@ -69,6 +69,11 @@ function openOverlay(s) {
   win.setIgnoreMouseEvents(true, { forward: true });
   win.loadFile(path.join(__dirname, 'renderer', 'overlay.html'), { query: { id: s.id } });
   win.on('closed', () => overlays.delete(s.id));
+  // Windows may still resize her (moving across screens with different scaling): put the size back.
+  win.on('resize', () => {
+    const b = win.getBounds(), want = boundsFor({ ...s, x: 0, y: 0 }, store.getClip(s.clipId) || clip);
+    if (b.width !== want.width || b.height !== want.height) win.setBounds({ x: b.x, y: b.y, width: want.width, height: want.height });
+  });
   overlays.set(s.id, { win, s });
   return win;
 }
@@ -138,15 +143,21 @@ ipcMain.on('overlay:ignore', (e, ignore) => {
   if (o) o.win.setIgnoreMouseEvents(ignore, { forward: true });
 });
 
-// Dragging: follow the cursor until the page says the button went up.
+// Dragging: follow the cursor until the page says the button went up. Always set the whole bounds
+// with the size the character should have: with Windows display scaling (125%, 150%…) setPosition
+// alone rounds the size a little each time, so a held window slowly stretched wider, taller or
+// bigger, and moving onto a screen with other scaling resized it too.
 let drag = null;
 ipcMain.on('overlay:drag', (e, on, offX, offY) => {
   const o = fromSender(e);
   if (!o) return;
   clearInterval(drag?.timer);
   drag = null;
+  const clip = store.getClip(o.s.clipId);
+  const { width, height } = boundsFor({ ...o.s, x: 0, y: 0 }, clip);
   if (!on) {
     const b = o.win.getBounds();
+    o.win.setBounds({ x: b.x, y: b.y, width, height });
     update(o.s.id, { x: b.x, y: b.y });
     return;
   }
@@ -154,7 +165,7 @@ ipcMain.on('overlay:drag', (e, on, offX, offY) => {
     timer: setInterval(() => {
       if (o.win.isDestroyed()) { clearInterval(drag?.timer); return; }
       const c = screen.getCursorScreenPoint();
-      o.win.setPosition(Math.round(c.x - offX), Math.round(c.y - offY));
+      o.win.setBounds({ x: Math.round(c.x - offX), y: Math.round(c.y - offY), width, height });
     }, 16),
   };
 });
